@@ -6,17 +6,41 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
+	log "github.com/sirupsen/logrus"
 )
+
+// slowRequestBodyThreshold bounds the noise from the read-timing log below.
+// Reading an already-buffered body is sub-millisecond, so anything past this is
+// the client still sending -- not this process being slow.
+const slowRequestBodyThreshold = 3 * time.Second
 
 // ReadRequestBody reads the incoming request body and decodes supported
 // Content-Encoding values before handlers inspect JSON fields.
 func ReadRequestBody(c *gin.Context) ([]byte, error) {
+	// GetRawData blocks until the client finishes sending. That wait lands inside
+	// the request's total time but before any upstream call, so a slow sender is
+	// indistinguishable from a slow upstream unless it is measured here.
+	readStart := time.Now()
 	raw, err := c.GetRawData()
+	readElapsed := time.Since(readStart)
 	if err != nil {
 		return nil, err
+	}
+	if readElapsed >= slowRequestBodyThreshold {
+		rate := ""
+		if secs := readElapsed.Seconds(); secs > 0 && len(raw) > 0 {
+			rate = fmt.Sprintf(", %.0f KB/s", float64(len(raw))/1024/secs)
+		}
+		path := ""
+		if c != nil && c.Request != nil {
+			path = c.Request.URL.Path
+		}
+		log.Warnf("slow request body read: %s for %d bytes%s (path=%s) -- the client was still sending; this is upstream of any provider call",
+			readElapsed.Round(time.Millisecond), len(raw), rate, path)
 	}
 
 	encoding := ""
