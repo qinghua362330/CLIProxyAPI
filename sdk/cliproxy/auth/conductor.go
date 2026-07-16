@@ -2712,6 +2712,11 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
+// slowStreamSetupThreshold bounds the noise from the timing log below: only a
+// setup slower than this is worth a line. Normal first-byte latency sits well
+// under it, so a hit means something actually stalled.
+const slowStreamSetupThreshold = 5 * time.Second
+
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
@@ -2720,9 +2725,28 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 
+	// This call returns once the bootstrap read has the stream's FIRST chunk, so
+	// its wall clock IS this layer's time-to-first-byte. Everything it spends on
+	// credential rotation and cooldown waits happens BEFORE the per-attempt
+	// first-byte timer starts, so an FBT log can never account for it: a caller
+	// seeing a slow first byte has, until now, no way to tell "the upstream was
+	// slow" from "we spent the time picking a credential". Report the split.
+	setupStart := time.Now()
+	attempts := 0
+	var cooldownWait time.Duration
+	defer func() {
+		elapsed := time.Since(setupStart)
+		if elapsed < slowStreamSetupThreshold {
+			return
+		}
+		log.Warnf("slow stream setup: %s to first chunk across %d attempt(s), %s of it waiting on credential cooldown (model=%s, providers=%v)",
+			elapsed.Round(time.Millisecond), attempts, cooldownWait.Round(time.Millisecond), req.Model, normalized)
+	}()
+
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	for attempt := 0; ; attempt++ {
+		attempts++
 		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
 		if errStream == nil {
 			return result, nil
@@ -2732,7 +2756,10 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		if !shouldRetry {
 			break
 		}
-		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
+		waitStart := time.Now()
+		errWait := waitForCooldown(ctx, wait, maxWait)
+		cooldownWait += time.Since(waitStart)
+		if errWait != nil {
 			return nil, errWait
 		}
 	}
