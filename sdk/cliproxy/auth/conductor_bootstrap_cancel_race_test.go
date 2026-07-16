@@ -137,15 +137,49 @@ func TestDrainAndCoolOnStatus_IgnoresStatuslessDrain(t *testing.T) {
 	ch <- cliproxyexecutor.StreamChunk{Err: context.Canceled} // status 0
 	close(ch)
 
-	m.drainAndCoolOnStatus(ch, auth, "claude", "gpt-5.5")
+	// Drain synchronously: the call returns only once the channel is drained to
+	// close, so the negative assertions below run against a definitely-finished
+	// drain rather than a sleep that might outrun it.
+	m.drainAndCoolOnStatusSync(ch, auth.ID, "claude", "gpt-5.5")
 
-	time.Sleep(50 * time.Millisecond)
 	got := markResultTestAuth(t, m, auth.ID)
 	if got.Failed != 0 {
 		t.Fatalf("Failed = %d, want 0 (a status-less drain must not penalize the account)", got.Failed)
 	}
 	if st := got.ModelStates["gpt-5.5"]; st != nil && !st.NextRetryAfter.IsZero() {
 		t.Fatalf("a status-less drain cooled the account: NextRetryAfter=%v", st.NextRetryAfter)
+	}
+}
+
+// Cooling is deliberately NOT deduped across an attempt's first-byte-timeout
+// reconnects. A shared first-arrival latch would let an early transient 503
+// suppress a later 429's quota suspension and Retry-After — under-cooling a
+// rate-limited account, the exact failure this path exists to prevent. Cooling
+// more than once only over-advances backoff, which is the safe direction, so each
+// stranded status is recorded on its own.
+func TestDrainAndCoolOnStatus_RecordsEveryStrandedStatus(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "per-reconnect", Provider: "claude", Status: StatusActive}
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// A transient 503 lands first, then the 429 the account really needs cooling for.
+	statuses := []int{http.StatusServiceUnavailable, http.StatusTooManyRequests}
+	for _, status := range statuses { // one abandoned reconnect per iteration
+		ch := make(chan cliproxyexecutor.StreamChunk, 1)
+		ch <- cliproxyexecutor.StreamChunk{Err: &Error{HTTPStatus: status, Message: http.StatusText(status)}}
+		close(ch)
+		m.drainAndCoolOnStatusSync(ch, auth.ID, "claude", "gpt-5.5")
+	}
+
+	got := markResultTestAuth(t, m, auth.ID)
+	if got.Failed != int64(len(statuses)) {
+		t.Fatalf("Failed = %d, want %d (every stranded status must be recorded)", got.Failed, len(statuses))
+	}
+	st := got.ModelStates["gpt-5.5"]
+	if st == nil || !st.Quota.Exceeded {
+		t.Fatalf("the later 429's quota suspension was dropped by the earlier 503: %+v", st)
 	}
 }
 

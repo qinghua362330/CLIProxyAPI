@@ -1218,6 +1218,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
+			// Deliberately NOT a sendTerminalChunk: a scanner I/O error carries no
+			// upstream status (upstreamStatusCode == 0), so there is nothing coolable
+			// to protect from the cancel race, and racing ctx.Done() here is the right
+			// way to unblock a mid-body read whose client walked away. Do not
+			// "unify" this with the terminal-status sends above — that would drag a
+			// blocking send onto a path with no status to save.
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
@@ -1733,6 +1739,10 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 // drains this channel to close — the bootstrap read while it is reading, then
 // drainAndCoolOnStatus / discardStreamChunks on the give-up paths, or the
 // forwarder after handoff — so a receiver is always present until close(out).
+// That invariant is enforced structurally, not by convention: the attempt closure
+// in Manager.executeStreamWithModelPool (sdk/cliproxy/auth/conductor.go) parks the
+// stream in pendingChunks and drains anything a branch did not take, so no
+// give-up path can strand this send.
 func sendTerminalChunk(out chan<- cliproxyexecutor.StreamChunk, chunk cliproxyexecutor.StreamChunk) {
 	out <- chunk
 }

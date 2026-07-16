@@ -59,6 +59,105 @@ func (e *firstByteThenStatusExecutor) callCount() int {
 	return e.calls
 }
 
+// firstByteThenSyncStatusExecutor stalls past the first-byte deadline and then
+// returns the real upstream status SYNCHRONOUSLY from ExecuteStream — the shape a
+// 429 takes when the executor parses the response status before it ever hands
+// back a stream. This is the P1 gate's own case: errFbFired is true, so only the
+// status-less check (upstreamStatusCode == 0) keeps it out of the reconnect
+// branch.
+type firstByteThenSyncStatusExecutor struct {
+	id       string
+	status   int
+	mu       sync.Mutex
+	calls    int
+	sawTimer bool
+}
+
+func (e *firstByteThenSyncStatusExecutor) Identifier() string { return e.id }
+
+func (e *firstByteThenSyncStatusExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusNotImplemented, Message: "Execute not implemented"}
+}
+
+func (e *firstByteThenSyncStatusExecutor) ExecuteStream(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.mu.Lock()
+	e.calls++
+	e.mu.Unlock()
+	// Record which branch won: only the ctx.Done() one puts the returned status in
+	// the race the P1 gate exists for. If the safety net wins instead, the timer
+	// never fired, errFbFired is false, and the ordinary non-FBT path would satisfy
+	// the test's assertions even with the gate broken — so the test asserts this.
+	timerFired := false
+	select {
+	case <-ctx.Done(): // the first-byte timer fired and cancelled the attempt
+		timerFired = true
+	case <-time.After(2 * time.Second): // safety net: fail fast instead of hanging if the timer never fires
+	}
+	e.mu.Lock()
+	e.sawTimer = timerFired
+	e.mu.Unlock()
+	return nil, &Error{HTTPStatus: e.status, Message: "rate limited"}
+}
+
+func (e *firstByteThenSyncStatusExecutor) sawFirstByteTimer() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.sawTimer
+}
+
+func (e *firstByteThenSyncStatusExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *firstByteThenSyncStatusExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusNotImplemented, Message: "CountTokens not implemented"}
+}
+
+func (e *firstByteThenSyncStatusExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, &Error{HTTPStatus: http.StatusNotImplemented, Message: "HttpRequest not implemented"}
+}
+
+func (e *firstByteThenSyncStatusExecutor) callCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
+}
+
+// TestExecuteStream_SyncRealStatusRacingFirstByteTimeoutCoolsAccount pins the P1
+// gate on the SYNCHRONOUS error path: a 429 returned by ExecuteStream itself, just
+// as the first-byte timer fires, must be cooled and rotated — not mistaken for a
+// first-byte timeout and re-rolled onto the same rate-limited account. Unlike the
+// async sibling below, this has one deterministic outcome, so it also asserts the
+// negative: exactly one upstream call, i.e. no FBT reconnect despite the budget.
+func TestExecuteStream_SyncRealStatusRacingFirstByteTimeoutCoolsAccount(t *testing.T) {
+	alias := "gpt-5.5"
+	executor := &firstByteThenSyncStatusExecutor{id: openAICompatPoolProviderKey, status: http.StatusTooManyRequests}
+	m := newFirstByteSameAuthManager(t, alias, executor, "auth-solo")
+
+	opts := cliproxyexecutor.Options{
+		Stream:                 true,
+		StreamFirstByteTimeout: 40 * time.Millisecond,
+		StreamFirstByteRetries: 1, // a reconnect budget the 429 must NOT consume
+	}
+	if _, err := m.ExecuteStream(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, opts); err == nil {
+		t.Fatal("ExecuteStream returned no error, want the upstream 429 surfaced")
+	}
+
+	// Without this the test proves nothing: the 429 must be returned INTO the
+	// first-byte timer's race, not after a quiet stall the gate never sees.
+	if !executor.sawFirstByteTimer() {
+		t.Fatal("executor returned the 429 without the first-byte timer firing; the P1 gate was never exercised")
+	}
+	auth := markResultTestAuth(t, m, "auth-solo")
+	st := auth.ModelStates[alias]
+	if auth.Failed == 0 || st == nil || st.NextRetryAfter.IsZero() {
+		t.Fatalf("account not cooled after a synchronous 429 racing the first-byte timer: Failed=%d ModelState=%+v", auth.Failed, st)
+	}
+	if got := executor.callCount(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (a real status must not be re-rolled as a first-byte timeout)", got)
+	}
+}
+
 // TestExecuteStream_RealStatusRacingFirstByteTimeoutCoolsAccount is the P1/P2
 // regression: a real upstream 429 delivered right as the first-byte timer fires
 // must still COOL the account — never be silently swallowed by the first-byte-
