@@ -2065,6 +2065,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			for {
 				attemptCtx := ctx
 				attemptCancel := context.CancelFunc(func() {})
+				// Wall clock for this attempt only: a first-byte timeout is otherwise
+				// invisible (the reconnect just re-enters the loop), which makes an
+				// end-to-end slow first byte impossible to attribute between "upstream
+				// stalled and we silently reconnected" and "the delay was never on the
+				// upstream leg at all". Logged on the FBT paths below.
+				attemptStart := time.Now()
 				var fbTimedOut atomic.Bool
 				var fbTimer *time.Timer
 				if firstByteTimeout > 0 {
@@ -2106,8 +2112,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 						}
 						if fbRetriesUsed < firstByteRetries {
 							fbRetriesUsed++
+							log.Warnf("first-byte timeout on connect after %s: %s (%s) model=%s, reconnecting on the same account (attempt %d/%d)",
+								time.Since(attemptStart).Round(time.Millisecond), provider, auth.ID, resultModel, fbRetriesUsed+1, firstByteRetries+1)
 							continue
 						}
+						log.Warnf("first-byte timeout on connect after %s: %s (%s) model=%s, giving up after %d attempts",
+							time.Since(attemptStart).Round(time.Millisecond), provider, auth.ID, resultModel, firstByteRetries+1)
 						attemptErr = firstByteTimeoutExhaustedError(firstByteTimeout, firstByteRetries+1)
 						return
 					}
@@ -2171,8 +2181,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					}
 					if fbRetriesUsed < firstByteRetries {
 						fbRetriesUsed++
+						log.Warnf("first-byte timeout waiting for payload after %s: %s (%s) model=%s, reconnecting on the same account (attempt %d/%d)",
+							time.Since(attemptStart).Round(time.Millisecond), provider, auth.ID, resultModel, fbRetriesUsed+1, firstByteRetries+1)
 						continue
 					}
+					log.Warnf("first-byte timeout waiting for payload after %s: %s (%s) model=%s, giving up after %d attempts",
+						time.Since(attemptStart).Round(time.Millisecond), provider, auth.ID, resultModel, firstByteRetries+1)
 					attemptErr = firstByteTimeoutExhaustedError(firstByteTimeout, firstByteRetries+1)
 					return
 				}
