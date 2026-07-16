@@ -225,6 +225,10 @@ routing:
 
 # Codex provider behavior.
 codex:
+  # Compress official ChatGPT Codex OAuth /responses request bodies with zstd in CGO builds.
+  # /responses/compact remains plaintext, matching the official client.
+  # Defaults to true when omitted; non-CGO builds remain plaintext. Set to false for an emergency rollback.
+  request-compression: true
   # When true, and routing.strategy is fill-first or routing.session-affinity is true,
   # remap Codex prompt_cache_key and installation identity per selected auth.
   # Some superstitious users believe request tracking identifiers can be used
