@@ -1726,39 +1726,66 @@ func discardStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
 	}()
 }
 
+// markResultFromError records a raw executor/stream error against an account via
+// MarkResult. The *Error it builds carries whatever real upstream status the raw
+// error holds (upstreamStatusCode) plus its Retry-After hint — exactly what
+// MarkResult's guard keys on: a status-less failure under a cancelled ctx is
+// skipped as cancel-caused, while a real 401/402/403/404/429/5xx is still
+// recorded so a rate-limited or unauthorized account is never left uncooled.
+// Every raw-error → Result → MarkResult site goes through here, so the status
+// extraction stays single-sourced.
+func (m *Manager) markResultFromError(ctx context.Context, authID, provider, model string, err error) {
+	if m == nil || authID == "" || err == nil {
+		return
+	}
+	rerr := &Error{Message: err.Error(), HTTPStatus: upstreamStatusCode(err)}
+	result := Result{AuthID: authID, Provider: provider, Model: model, Success: false, Error: rerr}
+	result.RetryAfter = retryAfterFromError(err)
+	m.MarkResult(ctx, result)
+}
+
 // drainAndCoolOnStatus drains an abandoned attempt's stream to close and, if a
 // real upstream status error surfaces during the drain (e.g. a 429 that landed
 // AFTER the bootstrap read already gave up on a first-byte timeout or client
-// cancel), records it via MarkResult so the rate-limited/unauthorized account is
-// still cooled instead of being hammered. It runs asynchronously so it never
-// blocks the caller and, like discardStreamChunks, relies on the producer
-// closing (every executor defers close). It records at most once — the terminal
-// status is the last chunk before close — so it cannot double-cool when the
-// bootstrap read already recorded the same error. A background context is used
-// because the client context is typically already cancelled here and a real
-// status must be recorded regardless.
+// cancel), records it so the rate-limited/unauthorized account is still cooled
+// instead of being hammered. It runs asynchronously so it never blocks the
+// caller and, like discardStreamChunks, relies on the producer closing (every
+// executor defers close). See drainAndCoolOnStatusSync for the cooling rules.
 func (m *Manager) drainAndCoolOnStatus(ch <-chan cliproxyexecutor.StreamChunk, auth *Auth, provider, resultModel string) {
 	if ch == nil || auth == nil {
 		return
 	}
 	authID := auth.ID
-	go func() {
-		marked := false
-		for chunk := range ch {
-			if marked || chunk.Err == nil {
-				continue
-			}
-			code := upstreamStatusCode(chunk.Err)
-			if code == 0 {
-				continue
-			}
-			marked = true
-			rerr := &Error{Message: chunk.Err.Error(), HTTPStatus: code}
-			result := Result{AuthID: authID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
-			result.RetryAfter = retryAfterFromError(chunk.Err)
-			m.MarkResult(context.Background(), result)
+	go m.drainAndCoolOnStatusSync(ch, authID, provider, resultModel)
+}
+
+// drainAndCoolOnStatusSync is drainAndCoolOnStatus's loop, run on the caller's
+// goroutine: it returns only once the stream has been drained to close, which is
+// what lets tests assert on the drain's effect without sleeping.
+//
+// It records at most once per drain — the terminal status is the last chunk
+// before close — so it cannot double-cool an error the bootstrap read already
+// recorded. It deliberately does NOT dedupe across an attempt's first-byte-timeout
+// reconnects: each reconnect can strand its own late status, so with a real status
+// after every one the account is cooled up to firstByteRetries+1 times, advancing
+// Failed/backoff further than the single request warrants. That is the safe
+// direction. Deduping via a shared first-arrival latch is NOT a fix — the statuses
+// can differ, and letting an early 503 (transient cooldown) suppress a later 429
+// would drop that 429's quota suspension and Retry-After, i.e. leave a
+// rate-limited account under-cooled: exactly the failure this whole path exists
+// to prevent. Trade backoff precision for that, never the reverse.
+//
+// A background context is used because the client context is typically already
+// cancelled here and a real status must be recorded regardless.
+func (m *Manager) drainAndCoolOnStatusSync(ch <-chan cliproxyexecutor.StreamChunk, authID, provider, resultModel string) {
+	marked := false
+	for chunk := range ch {
+		if marked || chunk.Err == nil || upstreamStatusCode(chunk.Err) == 0 {
+			continue
 		}
-	}()
+		marked = true
+		m.markResultFromError(context.Background(), authID, provider, resultModel, chunk.Err)
+	}
 }
 
 type streamBootstrapError struct {
@@ -2011,10 +2038,27 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			handedOff := false
 			var currentCancel context.CancelFunc
+			// pendingChunks holds the in-flight attempt's stream for as long as
+			// cleaning it up is still this closure's job; takePending transfers that
+			// job to a caller that drains it or hands it to the client forwarder, and
+			// the deferred guard drains whatever is left over. This keeps the drain
+			// invariant structural rather than by convention: sendTerminalChunk
+			// (internal/runtime/executor/codex_executor.go) deliberately does an
+			// escape-free BLOCKING send so a real status can never be dropped, which
+			// is leak-free ONLY while every post-bootstrap branch here drains to
+			// close. A future branch that forgets can no longer silently strand the
+			// executor's producer goroutine on that send.
+			var pendingChunks <-chan cliproxyexecutor.StreamChunk
+			takePending := func() <-chan cliproxyexecutor.StreamChunk {
+				ch := pendingChunks
+				pendingChunks = nil
+				return ch
+			}
 			defer func() {
 				if !handedOff && currentCancel != nil {
 					currentCancel()
 				}
+				discardStreamChunks(pendingChunks)
 			}()
 
 			fbRetriesUsed := 0
@@ -2082,13 +2126,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					// (status 0) but still records a real upstream 401/429/5xx even under a
 					// coincident client cancel, so a genuinely rate-limited/unauthorized
 					// account is not left uncooled.
-					rerr := &Error{Message: errStream.Error()}
-					if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
-						rerr.HTTPStatus = se.StatusCode()
-					}
-					result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
-					result.RetryAfter = retryAfterFromError(errStream)
-					m.MarkResult(ctx, result)
+					m.markResultFromError(ctx, auth.ID, provider, resultModel, errStream)
 					// Real status now recorded; if the client already gave up, stop here
 					// rather than trying this account's remaining models for a gone request.
 					if errCtx := ctx.Err(); errCtx != nil {
@@ -2104,6 +2142,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					return
 				}
 
+				pendingChunks = streamResult.Chunks
 				buffered, closed, bootstrapErr := readStreamBootstrap(attemptCtx, streamResult.Chunks)
 				// Treat "the first-byte timer fired" as authoritative from Stop()'s
 				// return rather than the racy atomic: the timer is stopped exactly once
@@ -2125,7 +2164,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					attemptCancel()
 					// Drain the abandoned attempt; if a real status (e.g. a 429) lands
 					// after this first-byte-timeout give-up, still cool the account.
-					m.drainAndCoolOnStatus(streamResult.Chunks, auth, provider, resultModel)
+					m.drainAndCoolOnStatus(takePending(), auth, provider, resultModel)
 					if errCtx := ctx.Err(); errCtx != nil {
 						attemptErr = errCtx
 						return
@@ -2147,7 +2186,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 						// byte. didRefreshOnUnauthorized prevents a second refresh, so this
 						// re-roll cannot loop.
 						attemptCancel()
-						discardStreamChunks(streamResult.Chunks)
+						discardStreamChunks(takePending())
 						auth = refreshed
 						didRefreshOnUnauthorized = true
 						continue
@@ -2156,18 +2195,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					// unconditionally: its guard skips a cancel-caused failure (status 0)
 					// but still records a real upstream 401/429/5xx under a coincident
 					// cancel, so a rate-limited/unauthorized account is not left uncooled.
-					rerr := &Error{Message: bootstrapErr.Error()}
-					if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-						rerr.HTTPStatus = se.StatusCode()
-					}
-					result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
-					result.RetryAfter = retryAfterFromError(bootstrapErr)
-					m.MarkResult(ctx, result)
+					m.markResultFromError(ctx, auth.ID, provider, resultModel, bootstrapErr)
 					// Drain the rest; if this give-up was a client cancel that raced a
 					// real status onto the stream after the bootstrap read returned the
 					// cancellation, drainAndCoolOnStatus still cools the account (it records
 					// at most once, so it will not double-cool the error just recorded).
-					m.drainAndCoolOnStatus(streamResult.Chunks, auth, provider, resultModel)
+					m.drainAndCoolOnStatus(takePending(), auth, provider, resultModel)
 					// Real status now recorded; if the client already gave up, stop here
 					// rather than trying this account's remaining models for a gone request.
 					if errCtx := ctx.Err(); errCtx != nil {
@@ -2205,7 +2238,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					return
 				}
 
-				remaining := streamResult.Chunks
+				remaining := takePending()
 				if closed {
 					closedCh := make(chan cliproxyexecutor.StreamChunk)
 					close(closedCh)
