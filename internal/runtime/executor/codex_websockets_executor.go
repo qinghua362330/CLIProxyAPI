@@ -16,8 +16,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
@@ -234,9 +232,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
-	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
-	applyModelHeaderOverrides(wsHeaders, baseModel)
-	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
+	wsHeaders = applyCodexManagedWebsocketHeaders(ctx, wsHeaders, opts.Headers, auth, apiKey, e.cfg, baseModel, &identityState, strings.TrimSpace(gjson.GetBytes(upstreamBody, "prompt_cache_key").String()), httpURL)
 
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -456,9 +452,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, body)
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
-	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
-	applyModelHeaderOverrides(wsHeaders, baseModel)
-	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
+	wsHeaders = applyCodexManagedWebsocketHeaders(ctx, wsHeaders, opts.Headers, auth, apiKey, e.cfg, baseModel, &identityState, strings.TrimSpace(gjson.GetBytes(upstreamBody, "prompt_cache_key").String()), httpURL)
 
 	var authID, authLabel, authType, authValue string
 	authID = auth.ID
@@ -905,18 +899,31 @@ func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktransl
 
 	if cache.ID != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
-		// Live-captured from real codex 0.142.5: the responses request carries
-		// lowercase hyphenated "session-id" AND "thread-id" (same UUID) and does
-		// NOT send "Conversation_id". Emit the real shape; dropping Conversation_id
-		// removes a CPA tell. Internal routing/prompt-cache key off cache.ID, not
-		// the header name, so this is an out-of-band (outbound-only) change.
-		setCodexSessionThreadHeaders(headers, cache.ID)
 	}
 
 	return rawJSON, headers, nil
 }
 
 func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config) http.Header {
+	sourceHeaders := codexRequestHeaderSource(ctx, nil)
+	targetURL := "https://chatgpt.com" + codexOfficialResponsesPath
+	pairOAuthIdentity := codexShouldPairOAuthIdentity(auth, targetURL)
+	headers = applyCodexWebsocketHeadersFromSources(headers, sourceHeaders, auth, token, cfg, pairOAuthIdentity)
+	finalizeCodexRequestHeaders(headers, sourceHeaders, "", pairOAuthIdentity, codexFallbackUserAgent(auth, cfg))
+	return headers
+}
+
+func applyCodexManagedWebsocketHeaders(ctx context.Context, headers http.Header, explicitHeaders http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config, modelName string, identityState *codexIdentityConfuseState, promptCacheFallback string, targetURL string) http.Header {
+	sourceHeaders := codexRequestHeaderSource(ctx, explicitHeaders)
+	pairOAuthIdentity := codexShouldPairOAuthIdentity(auth, targetURL)
+	headers = applyCodexWebsocketHeadersFromSources(headers, sourceHeaders, auth, token, cfg, pairOAuthIdentity)
+	applyModelHeaderOverrides(headers, modelName)
+	applyCodexIdentityConfuseHeaders(headers, identityState)
+	finalizeCodexRequestHeaders(headers, sourceHeaders, promptCacheFallback, pairOAuthIdentity, codexFallbackUserAgent(auth, cfg))
+	return headers
+}
+
+func applyCodexWebsocketHeadersFromSources(headers http.Header, sourceHeaders http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config, pairOAuthIdentity bool) http.Header {
 	if headers == nil {
 		headers = http.Header{}
 	}
@@ -924,39 +931,32 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		headers.Set("Authorization", "Bearer "+token)
 	}
 
-	var ginHeaders http.Header
-	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-		ginHeaders = ginCtx.Request.Header.Clone()
-	}
-
-	isAPIKey := codexAuthUsesAPIKey(auth)
+	isAPIKey := codexAuthIsAPIKey(auth)
 	cfgUserAgent, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
-	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, codexDefaultBetaFeatures)
-	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
-	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
-	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
-	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
-	misc.EnsureHeader(headers, ginHeaders, "Version", "")
-	if isAPIKey {
-		ensureHeaderWithPriority(headers, ginHeaders, "User-Agent", "", "")
+	ensureHeaderWithPriority(headers, sourceHeaders, "x-codex-beta-features", cfgBetaFeatures, codexDefaultBetaFeatures)
+	misc.EnsureHeader(headers, sourceHeaders, "x-codex-turn-state", "")
+	misc.EnsureHeader(headers, sourceHeaders, "x-codex-turn-metadata", "")
+	misc.EnsureHeader(headers, sourceHeaders, "x-responsesapi-include-timing-metrics", "")
+	misc.EnsureHeader(headers, sourceHeaders, "Version", "")
+	if isAPIKey || !pairOAuthIdentity {
+		ensureHeaderWithConfigPrecedence(headers, sourceHeaders, "User-Agent", cfgUserAgent, "")
 	} else {
-		ensureCodexUserAgent(headers, ginHeaders, cfgUserAgent, helps.PerAccountCodexUserAgent(helps.AccountFingerprintKey(auth, ""), codexUserAgent, cfg))
+		// Preserve the highest-precedence candidate until the shared finalizer can
+		// derive User-Agent and Originator from one validated client identity.
+		ensureHeaderWithConfigPrecedence(headers, sourceHeaders, "User-Agent", cfgUserAgent, codexFallbackUserAgent(auth, cfg))
 	}
 
 	betaHeader := strings.TrimSpace(headers.Get("OpenAI-Beta"))
-	if betaHeader == "" && ginHeaders != nil {
-		betaHeader = strings.TrimSpace(ginHeaders.Get("OpenAI-Beta"))
+	if betaHeader == "" && sourceHeaders != nil {
+		betaHeader = strings.TrimSpace(sourceHeaders.Get("OpenAI-Beta"))
 	}
 	if betaHeader == "" || !strings.Contains(betaHeader, "responses_websockets=") {
 		betaHeader = codexResponsesWebsocketBetaHeaderValue
 	}
 	headers.Set("OpenAI-Beta", betaHeader)
-	sessionFallback := ""
-	if strings.Contains(headers.Get("User-Agent"), "Mac OS") {
-		sessionFallback = uuid.NewString()
+	if isAPIKey || !pairOAuthIdentity {
+		setCodexRawOriginator(headers, headerValueCaseInsensitive(sourceHeaders, "Originator"))
 	}
-	ensureCodexWebsocketSessionHeader(headers, ginHeaders, sessionFallback)
-	setCodexOriginator(headers, ginHeaders.Get("Originator"), isAPIKey)
 	if !isAPIKey {
 		if auth != nil && auth.Metadata != nil {
 			if accountID, ok := auth.Metadata["account_id"].(string); ok {
@@ -976,20 +976,6 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	return headers
 }
 
-func ensureCodexWebsocketSessionHeader(target http.Header, source http.Header, fallbackValue string) {
-	if target == nil {
-		return
-	}
-	sessionID := codexSessionHeaderValue(target)
-	if sessionID == "" {
-		sessionID = codexSessionHeaderValue(source)
-	}
-	if sessionID == "" {
-		sessionID = strings.TrimSpace(fallbackValue)
-	}
-	setCodexSessionThreadHeaders(target, sessionID)
-}
-
 func codexSessionHeaderValue(headers http.Header) string {
 	for _, key := range []string{"session-id", "Session-Id", "Session_id", "session_id"} {
 		if value := strings.TrimSpace(headerValueCaseInsensitive(headers, key)); value != "" {
@@ -997,13 +983,6 @@ func codexSessionHeaderValue(headers http.Header) string {
 		}
 	}
 	return ""
-}
-
-func codexAuthUsesAPIKey(auth *cliproxyauth.Auth) bool {
-	if auth == nil || auth.Attributes == nil {
-		return false
-	}
-	return strings.TrimSpace(auth.Attributes["api_key"]) != ""
 }
 
 func ensureHeaderCasePreserved(target http.Header, source http.Header, key, configValue, fallbackValue string) {
@@ -1041,67 +1020,74 @@ func setHeaderCasePreserved(headers http.Header, key string, value string) {
 	headers[key] = []string{value}
 }
 
-// setCodexSessionThreadHeaders forces the outbound shape of real codex 0.142.5:
-// lowercase hyphenated "session-id" AND "thread-id" (same UUID). It purges the
-// legacy underscore variants and the "Conversation_id" header (a tell the real
-// client never sends). Uses direct map assignment because http.Header.Set would
-// canonicalize the key to "Session-Id". Live-captured from real codex 0.142.5.
-func setCodexSessionThreadHeaders(headers http.Header, id string) {
+// setCodexSessionThreadHeaders emits the canonical lowercase Codex ID headers
+// without coupling independently supplied session and thread identities.
+func setCodexSessionThreadHeaders(headers http.Header, sessionID string, threadID string) {
 	if headers == nil {
 		return
 	}
-	// Order matters: underscore/Conversation variants first (EqualFold won't match
-	// the hyphen forms), then the hyphen forms (EqualFold clears any-case), then set
-	// the exact lowercase keys.
 	for _, k := range []string{"session_id", "Session_id", "thread_id", "Thread_id", "Conversation_id", "Conversation-Id", "session-id", "thread-id"} {
 		deleteHeaderCaseInsensitive(headers, k)
 	}
-	if strings.TrimSpace(id) == "" {
-		return
+	if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
+		headers["session-id"] = []string{sessionID}
 	}
-	headers["session-id"] = []string{id}
-	headers["thread-id"] = []string{id}
+	if threadID = strings.TrimSpace(threadID); threadID != "" {
+		headers["thread-id"] = []string{threadID}
+	}
 }
 
-func setCodexSessionHeaderCasePreserved(headers http.Header, fallbackKey string, value string) {
+func setCodexClientRequestID(headers http.Header, value string) {
 	if headers == nil {
 		return
 	}
-	fallbackKey = strings.TrimSpace(fallbackKey)
-	value = strings.TrimSpace(value)
-	if fallbackKey == "" || value == "" {
+	deleteHeaderCaseInsensitive(headers, "x-client-request-id")
+	if value = strings.TrimSpace(value); value != "" {
+		headers["x-client-request-id"] = []string{value}
+	}
+}
+
+func codexThreadHeaderValue(headers http.Header) string {
+	for _, key := range []string{"thread-id", "Thread-Id", "thread_id", "Thread_id"} {
+		if value := strings.TrimSpace(headerValueCaseInsensitive(headers, key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func codexClientRequestIDValue(headers http.Header) string {
+	return strings.TrimSpace(headerValueCaseInsensitive(headers, "x-client-request-id"))
+}
+
+func codexResolvedHeaderValue(target http.Header, source http.Header, value func(http.Header) string) string {
+	if resolved := value(target); resolved != "" {
+		return resolved
+	}
+	return value(source)
+}
+
+func finalizeCodexRequestHeaders(target http.Header, explicitSource http.Header, promptCacheFallback string, pairOAuthIdentity bool, fallbackUserAgent string) {
+	if target == nil {
 		return
 	}
-
-	selectedKey := ""
-	if _, ok := headers[fallbackKey]; ok && codexSessionHeaderKeyUsesUnderscore(fallbackKey) {
-		selectedKey = fallbackKey
-	} else {
-		for existingKey := range headers {
-			if codexSessionHeaderKeyUsesUnderscore(existingKey) {
-				selectedKey = existingKey
-				break
-			}
+	sessionID := codexResolvedHeaderValue(target, explicitSource, codexSessionHeaderValue)
+	threadID := codexResolvedHeaderValue(target, explicitSource, codexThreadHeaderValue)
+	if sessionID == "" && threadID == "" {
+		if fallback := strings.TrimSpace(promptCacheFallback); fallback != "" {
+			sessionID = fallback
+			threadID = fallback
 		}
 	}
-	if selectedKey == "" {
-		selectedKey = fallbackKey
+	clientRequestID := codexResolvedHeaderValue(target, explicitSource, codexClientRequestIDValue)
+	if clientRequestID == "" {
+		clientRequestID = threadID
 	}
-	for existingKey := range headers {
-		if codexSessionHeaderKey(existingKey) && existingKey != selectedKey {
-			delete(headers, existingKey)
-		}
+	setCodexSessionThreadHeaders(target, sessionID, threadID)
+	setCodexClientRequestID(target, clientRequestID)
+	if pairOAuthIdentity {
+		finalizeCodexOAuthClientIdentity(target, fallbackUserAgent)
 	}
-	headers[selectedKey] = []string{value}
-}
-
-func codexSessionHeaderKey(key string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(key))
-	return normalized == "session_id" || normalized == "session-id"
-}
-
-func codexSessionHeaderKeyUsesUnderscore(key string) bool {
-	return strings.ToLower(strings.TrimSpace(key)) == "session_id"
 }
 
 func headerValueCaseInsensitive(headers http.Header, key string) string {
@@ -1209,105 +1195,179 @@ var codexFirstPartyClients = []string{
 	"codex_vscode",
 }
 
-// officialCodexUserAgentPrefixes are the "{client}/" User-Agent prefixes derived
-// from codexFirstPartyClients. Only these are forwarded verbatim to the ChatGPT
-// OAuth backend; any other (or absent) UA is replaced with the canonical Codex UA.
-// Kept strict so a too-broad prefix such as bare "codex/" cannot let "codex/evil"
-// through, and third-party agents (e.g. opencode) normalize to the official UA.
-var officialCodexUserAgentPrefixes = codexClientUAPrefixes()
-
-func codexClientUAPrefixes() []string {
-	prefixes := make([]string, len(codexFirstPartyClients))
-	for i, name := range codexFirstPartyClients {
-		prefixes[i] = strings.ToLower(strings.TrimSpace(name)) + "/"
-	}
-	return prefixes
-}
-
-// isOfficialCodexUserAgent reports whether ua looks like a first-party Codex CLI.
-func isOfficialCodexUserAgent(ua string) bool {
-	u := strings.ToLower(strings.TrimSpace(ua))
-	if u == "" {
-		return false
-	}
-	for _, prefix := range officialCodexUserAgentPrefixes {
-		if strings.HasPrefix(u, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-// ensureCodexUserAgent sets the outbound Codex User-Agent for OAuth traffic with
-// precedence: existing target value > operator config > forwarded client UA (only
-// when it is a recognized Codex CLI) > canonical fallback. This prevents leaking
-// a foreign downstream User-Agent (e.g. an OpenAI SDK's) to the ChatGPT backend,
-// which would be an obvious client-fingerprint mismatch. Operator config is always
-// honored verbatim, so custom clients remain configurable.
-func ensureCodexUserAgent(target, source http.Header, configValue, fallbackValue string) {
+// setCodexRawOriginator preserves client identity only for API-key and custom
+// OAuth targets. Official OAuth targets derive Originator from the final UA.
+func setCodexRawOriginator(target http.Header, clientOriginator string) {
 	if target == nil {
 		return
 	}
-	if strings.TrimSpace(target.Get("User-Agent")) != "" {
-		return
+	if value := strings.TrimSpace(clientOriginator); value != "" {
+		target.Set("Originator", value)
 	}
-	if val := strings.TrimSpace(configValue); val != "" {
-		target.Set("User-Agent", val)
-		return
-	}
-	if source != nil {
-		if val := strings.TrimSpace(source.Get("User-Agent")); val != "" && isOfficialCodexUserAgent(val) {
-			target.Set("User-Agent", val)
-			return
+}
+
+const (
+	codexClientNameMaxLen = 64
+	codexUserAgentMaxLen  = 1024
+)
+
+func codexCanonicalFirstPartyClient(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	for _, candidate := range codexFirstPartyClients {
+		if strings.EqualFold(value, candidate) {
+			return candidate, true
 		}
 	}
-	if val := strings.TrimSpace(fallbackValue); val != "" {
-		target.Set("User-Agent", val)
+	return "", false
+}
+
+func codexSaneClientName(value string) bool {
+	if value == "" || len(value) > codexClientNameMaxLen || strings.ContainsRune(value, '/') {
+		return false
 	}
-}
-
-// officialCodexOriginators is the exact-match Originator set derived from the same
-// codexFirstPartyClients source of truth as officialCodexUserAgentPrefixes, so the
-// Originator and User-Agent allowlists can never disagree on which clients are
-// first-party. The previous loose "codex" prefix let a plausible-but-foreign value
-// like "Codex Desktop" — or an injected "codexZZZ" — through while the User-Agent
-// normalized to codex_cli_rs, producing a cross-layer identity mismatch
-// (UA=codex_cli_rs vs Originator=Codex Desktop) that the fingerprint observatory
-// caught live on real accounts. Exact matching keeps Originator and UA consistent.
-var officialCodexOriginators = codexOriginatorSet()
-
-func codexOriginatorSet() map[string]struct{} {
-	set := make(map[string]struct{}, len(codexFirstPartyClients))
-	for _, name := range codexFirstPartyClients {
-		set[strings.ToLower(strings.TrimSpace(name))] = struct{}{}
-	}
-	return set
-}
-
-// isOfficialCodexOriginator reports whether an Originator value is exactly a
-// first-party Codex token (case-insensitive).
-func isOfficialCodexOriginator(originator string) bool {
-	_, ok := officialCodexOriginators[strings.ToLower(strings.TrimSpace(originator))]
-	return ok
-}
-
-// setCodexOriginator sets the Originator header. API-key traffic forwards the
-// client value as-is; OAuth traffic (ChatGPT backend) forwards it only when it
-// is a recognized Codex originator, otherwise it is normalized to the canonical
-// codexOriginator so a foreign value never leaks upstream.
-func setCodexOriginator(target http.Header, clientOriginator string, isAPIKey bool) {
-	o := strings.TrimSpace(clientOriginator)
-	if isAPIKey {
-		if o != "" {
-			target.Set("Originator", o)
+	for i := 0; i < len(value); i++ {
+		if value[i] < 0x20 || value[i] > 0x7e {
+			return false
 		}
+	}
+	return true
+}
+
+func codexSaneUserAgent(value string) bool {
+	if value == "" || len(value) > codexUserAgentMaxLen {
+		return false
+	}
+	depth := 0
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c < 0x20 || c > 0x7e {
+			return false
+		}
+		switch c {
+		case '(':
+			depth++
+			if depth > 1 {
+				return false
+			}
+		case ')':
+			depth--
+			if depth < 0 {
+				return false
+			}
+		}
+	}
+	return depth == 0
+}
+
+func codexUserAgentProduct(value string) (string, int, bool) {
+	slash := strings.IndexByte(value, '/')
+	if slash <= 0 || slash == len(value)-1 {
+		return "", 0, false
+	}
+	product := strings.TrimSpace(value[:slash])
+	if !codexSaneClientName(product) {
+		return "", 0, false
+	}
+	remainder := value[slash+1:]
+	versionEnd := strings.IndexAny(remainder, " (")
+	if versionEnd < 0 {
+		versionEnd = len(remainder)
+	}
+	version := remainder[:versionEnd]
+	if version == "" || strings.ContainsAny(version, "/()") {
+		return "", 0, false
+	}
+	return product, slash, true
+}
+
+func codexFinalUserAgentTrailerName(value string) (string, bool) {
+	if !strings.HasSuffix(value, ")") {
+		return "", false
+	}
+	open := strings.LastIndexByte(value, '(')
+	if open < 0 || open == len(value)-1 {
+		return "", false
+	}
+	inner := value[open+1 : len(value)-1]
+	if strings.ContainsAny(inner, "()") || strings.Count(inner, ";") != 1 {
+		return "", false
+	}
+	parts := strings.SplitN(inner, ";", 2)
+	name := strings.TrimSpace(parts[0])
+	version := strings.TrimSpace(parts[1])
+	if !codexSaneClientName(name) || version == "" || strings.ContainsAny(version, "/()") {
+		return "", false
+	}
+	canonical, ok := codexCanonicalFirstPartyClient(name)
+	return canonical, ok
+}
+
+func pairCodexClientIdentity(userAgent string) (originator string, pairedUserAgent string, ok bool) {
+	ua := strings.TrimSpace(userAgent)
+	if !codexSaneUserAgent(ua) {
+		return "", "", false
+	}
+	product, slash, productOK := codexUserAgentProduct(ua)
+	if !productOK {
+		return "", "", false
+	}
+	if canonical, recognized := codexCanonicalFirstPartyClient(product); recognized {
+		return canonical, canonical + ua[slash:], true
+	}
+	if trailer, recognized := codexFinalUserAgentTrailerName(ua); recognized {
+		return trailer, trailer + ua[slash:], true
+	}
+	return "", "", false
+}
+
+func finalizeCodexOAuthClientIdentity(headers http.Header, fallbackUserAgent string) {
+	if headers == nil {
 		return
 	}
-	if o != "" && isOfficialCodexOriginator(o) {
-		target.Set("Originator", o)
-		return
+	userAgent := headerValueCaseInsensitive(headers, "User-Agent")
+	originator, pairedUserAgent, ok := pairCodexClientIdentity(userAgent)
+	if !ok {
+		originator, pairedUserAgent, ok = pairCodexClientIdentity(fallbackUserAgent)
 	}
-	target.Set("Originator", codexOriginator)
+	if !ok {
+		originator = codexOriginator
+		pairedUserAgent = codexUserAgent
+	}
+	headers.Set("User-Agent", pairedUserAgent)
+	headers.Set("Originator", originator)
+}
+
+func codexOfficialIdentityTarget(targetURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(targetURL))
+	if err != nil || parsed.Opaque != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawPath != "" {
+		return false
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "https" && scheme != "wss" {
+		return false
+	}
+	if !strings.EqualFold(parsed.Hostname(), "chatgpt.com") {
+		return false
+	}
+	if port := parsed.Port(); port != "" && port != "443" {
+		return false
+	}
+	if strings.HasSuffix(parsed.Host, ":") {
+		return false
+	}
+	switch parsed.Path {
+	case codexOfficialResponsesPath,
+		codexOfficialCompactPath,
+		"/backend-api/codex" + codexDirectImagesGenerations,
+		"/backend-api/codex" + codexDirectImagesEdit:
+		return true
+	default:
+		return false
+	}
+}
+
+func codexShouldPairOAuthIdentity(auth *cliproxyauth.Auth, targetURL string) bool {
+	return !codexAuthIsAPIKey(auth) && codexOfficialIdentityTarget(targetURL)
 }
 
 type statusErrWithHeaders struct {

@@ -458,7 +458,7 @@ func TestApplyCodexManagedRequestHeaders_ContentEncodingOverrides(t *testing.T) 
 			if tt.applyModel {
 				requestModel = modelName
 			}
-			applyCodexManagedRequestHeaders(httpReq, tt.auth, "token", true, nil, requestModel, nil)
+			applyCodexManagedRequestHeaders(httpReq, tt.auth, "token", true, nil, requestModel, nil, nil)
 			if got := httpReq.Header.Get(tt.wantSignalName); got != "applied" {
 				t.Fatalf("%s = %q, want applied", tt.wantSignalName, got)
 			}

@@ -475,7 +475,7 @@ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing
 	if got := headers.Get("X-Codex-Turn-Metadata"); got != `{"turn_id":"turn-1"}` {
 		t.Fatalf("X-Codex-Turn-Metadata = %s, want %s", got, `{"turn_id":"turn-1"}`)
 	}
-	if got := headers.Get("X-Client-Request-Id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
+	if got := headerValueCaseInsensitive(headers, "x-client-request-id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
 		t.Fatalf("X-Client-Request-Id = %s, want %s", got, "019d2233-e240-7162-992d-38df0a2a0e0d")
 	}
 	if got := headers["session-id"]; len(got) != 1 || got[0] != "legacy-session" {
@@ -510,7 +510,7 @@ func TestApplyCodexWebsocketHeadersCanonicalizesLegacyUnderscoreSessionHeader(t 
 func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
-			UserAgent:    "my-codex-client/1.0",
+			UserAgent:    "codex_vscode/1.0",
 			BetaFeatures: "feature-a,feature-b",
 		},
 	}
@@ -521,8 +521,11 @@ func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
 
 	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "", cfg)
 
-	if got := headers.Get("User-Agent"); got != "my-codex-client/1.0" {
-		t.Fatalf("User-Agent = %s, want %s", got, "my-codex-client/1.0")
+	if got := headers.Get("User-Agent"); got != "codex_vscode/1.0" {
+		t.Fatalf("User-Agent = %s, want %s", got, "codex_vscode/1.0")
+	}
+	if got := headers.Get("Originator"); got != "codex_vscode" {
+		t.Fatalf("Originator = %s, want codex_vscode", got)
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "feature-a,feature-b" {
 		t.Fatalf("x-codex-beta-features = %s, want %s", got, "feature-a,feature-b")
@@ -535,7 +538,7 @@ func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
 func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
-			UserAgent:    "config-ua",
+			UserAgent:    "codex_vscode/2.0",
 			BetaFeatures: "config-beta",
 		},
 	}
@@ -544,17 +547,20 @@ func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *
 		Metadata: map[string]any{"email": "user@example.com"},
 	}
 	ctx := contextWithGinHeaders(map[string]string{
-		"User-Agent":            "client-ua",
+		"User-Agent":            "codex-tui/3.0",
 		"X-Codex-Beta-Features": "client-beta",
 	})
 	headers := http.Header{}
-	headers.Set("User-Agent", "existing-ua")
+	headers.Set("User-Agent", "codex_exec/4.0")
 	headers.Set("X-Codex-Beta-Features", "existing-beta")
 
 	got := applyCodexWebsocketHeaders(ctx, headers, auth, "", cfg)
 
-	if gotVal := got.Get("User-Agent"); gotVal != "existing-ua" {
-		t.Fatalf("User-Agent = %s, want %s", gotVal, "existing-ua")
+	if gotVal := got.Get("User-Agent"); gotVal != "codex_exec/4.0" {
+		t.Fatalf("User-Agent = %s, want %s", gotVal, "codex_exec/4.0")
+	}
+	if gotVal := got.Get("Originator"); gotVal != "codex_exec" {
+		t.Fatalf("Originator = %s, want codex_exec", gotVal)
 	}
 	if gotVal := got.Get("x-codex-beta-features"); gotVal != "existing-beta" {
 		t.Fatalf("x-codex-beta-features = %s, want %s", gotVal, "existing-beta")
@@ -564,7 +570,7 @@ func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *
 func TestApplyCodexWebsocketHeadersConfigUserAgentOverridesClientHeader(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
-			UserAgent:    "config-ua",
+			UserAgent:    "codex_vscode/2.0",
 			BetaFeatures: "config-beta",
 		},
 	}
@@ -573,14 +579,17 @@ func TestApplyCodexWebsocketHeadersConfigUserAgentOverridesClientHeader(t *testi
 		Metadata: map[string]any{"email": "user@example.com"},
 	}
 	ctx := contextWithGinHeaders(map[string]string{
-		"User-Agent":            "client-ua",
+		"User-Agent":            "codex-tui/3.0",
 		"X-Codex-Beta-Features": "client-beta",
 	})
 
 	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", cfg)
 
-	if got := headers.Get("User-Agent"); got != "config-ua" {
-		t.Fatalf("User-Agent = %s, want %s", got, "config-ua")
+	if got := headers.Get("User-Agent"); got != "codex_vscode/2.0" {
+		t.Fatalf("User-Agent = %s, want %s", got, "codex_vscode/2.0")
+	}
+	if got := headers.Get("Originator"); got != "codex_vscode" {
+		t.Fatalf("Originator = %s, want codex_vscode", got)
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "client-beta" {
 		t.Fatalf("x-codex-beta-features = %s, want %s", got, "client-beta")
@@ -646,7 +655,9 @@ func TestApplyCodexWebsocketHeadersUsesCanonicalAccountHeader(t *testing.T) {
 func TestApplyCodexPromptCacheHeadersSetsSessionIDAndLegacyConversation(t *testing.T) {
 	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"prompt_cache_key":"cache-1"}`)}
 
-	_, headers := applyCodexPromptCacheHeaders("openai-response", req, []byte(`{"model":"gpt-5-codex"}`))
+	body, headers := applyCodexPromptCacheHeaders("openai-response", req, []byte(`{"model":"gpt-5-codex"}`))
+	promptCacheKey := gjson.GetBytes(body, "prompt_cache_key").String()
+	headers = applyCodexManagedWebsocketHeaders(context.Background(), headers, nil, nil, "", nil, req.Model, nil, promptCacheKey, "https://chatgpt.com"+codexOfficialResponsesPath)
 
 	if got := headers["session-id"]; len(got) != 1 || got[0] != "cache-1" {
 		t.Fatalf("session-id = %#v, want [cache-1]", got)
@@ -689,6 +700,8 @@ func TestApplyCodexPromptCacheHeadersClaudeUsesClaudeCodeSessionID(t *testing.T)
 	if secondKey != firstKey {
 		t.Fatalf("same Claude Code session_id produced different websocket prompt_cache_key: first=%q second=%q", firstKey, secondKey)
 	}
+	firstHeaders = applyCodexManagedWebsocketHeaders(context.Background(), firstHeaders, nil, nil, "", nil, firstReq.Model, nil, firstKey, "https://chatgpt.com"+codexOfficialResponsesPath)
+	secondHeaders = applyCodexManagedWebsocketHeaders(context.Background(), secondHeaders, nil, nil, "", nil, secondReq.Model, nil, secondKey, "https://chatgpt.com"+codexOfficialResponsesPath)
 	if got := firstHeaders["session-id"]; len(got) != 1 || got[0] != firstKey {
 		t.Fatalf("first session-id = %#v, want [%q]", got, firstKey)
 	}
@@ -736,8 +749,7 @@ func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testin
 		"X-Codex-Turn-Metadata": `{"prompt_cache_key":"cache-ws-1","turn_id":"turn-ws-1","window_id":"cache-ws-1:0"}`,
 		"X-Client-Request-Id":   "client-request-1",
 	})
-	headers = applyCodexWebsocketHeaders(ctx, headers, auth, "oauth-token", cfg)
-	applyCodexIdentityConfuseHeaders(headers, &identityState)
+	headers = applyCodexManagedWebsocketHeaders(ctx, headers, nil, auth, "oauth-token", cfg, req.Model, &identityState, gjson.GetBytes(body, "prompt_cache_key").String(), "https://chatgpt.com"+codexOfficialResponsesPath)
 
 	expectedPromptCacheKey := codexIdentityConfuseUUID("auth-ws-1", "prompt-cache", "cache-ws-1")
 	expectedTurnID := codexIdentityConfuseUUID("auth-ws-1", "turn", "turn-ws-1")
@@ -750,8 +762,8 @@ func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testin
 	if gotCanonicalSession := headers.Get("Session-Id"); gotCanonicalSession != "" {
 		t.Fatalf("Session-Id = %q, want empty", gotCanonicalSession)
 	}
-	if gotRequestID := headers.Get("X-Client-Request-Id"); gotRequestID != expectedPromptCacheKey {
-		t.Fatalf("X-Client-Request-Id = %q, want %q", gotRequestID, expectedPromptCacheKey)
+	if gotRequestID := headerValueCaseInsensitive(headers, "x-client-request-id"); gotRequestID != "client-request-1" {
+		t.Fatalf("x-client-request-id = %q, want explicit client-request-1", gotRequestID)
 	}
 	if gotThreadID := headers["thread-id"]; len(gotThreadID) != 1 || gotThreadID[0] != expectedPromptCacheKey {
 		t.Fatalf("thread-id = %#v, want [%q]", gotThreadID, expectedPromptCacheKey)
@@ -909,13 +921,13 @@ func TestParseCodexWebsocketErrorPreservesWrappedBodyAndHeaders(t *testing.T) {
 }
 
 func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
-	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com"+codexOfficialResponsesPath, nil)
 	if err != nil {
 		t.Fatalf("NewRequest() error = %v", err)
 	}
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
-			UserAgent:    "config-ua",
+			UserAgent:    "codex_vscode/2.0",
 			BetaFeatures: "config-beta",
 		},
 	}
@@ -929,8 +941,11 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 
 	applyCodexHeaders(req, auth, "oauth-token", true, cfg)
 
-	if got := req.Header.Get("User-Agent"); got != "config-ua" {
-		t.Fatalf("User-Agent = %s, want %s", got, "config-ua")
+	if got := req.Header.Get("User-Agent"); got != "codex_vscode/2.0" {
+		t.Fatalf("User-Agent = %s, want %s", got, "codex_vscode/2.0")
+	}
+	if got := req.Header.Get("Originator"); got != "codex_vscode" {
+		t.Fatalf("Originator = %s, want codex_vscode", got)
 	}
 	// OAuth path now fills x-codex-beta-features (client > config > default);
 	// config value wins here.
@@ -961,8 +976,8 @@ func TestApplyModelHeaderOverridesFromModelConfig(t *testing.T) {
 	if got := req.Header.Get("User-Agent"); got != wantUA {
 		t.Fatalf("User-Agent = %q, want %q", got, wantUA)
 	}
-	if got := codexSessionHeaderValue(req.Header); got == "" {
-		t.Fatal("expected Session_id to be set for Mac OS User-Agent override")
+	if got := codexSessionHeaderValue(req.Header); got != "" {
+		t.Fatalf("model override must not synthesize a session ID, got %q", got)
 	}
 
 	applyModelHeaderOverrides(req.Header, "gpt-5.4")
@@ -1005,7 +1020,7 @@ func TestApplyModelHeaderOverridesMultipleHeaders(t *testing.T) {
 }
 
 func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
-	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com"+codexOfficialResponsesPath, nil)
 	if err != nil {
 		t.Fatalf("NewRequest() error = %v", err)
 	}
@@ -1033,7 +1048,7 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	if got := req.Header.Get("X-Codex-Turn-Metadata"); got != `{"turn_id":"turn-1"}` {
 		t.Fatalf("X-Codex-Turn-Metadata = %s, want %s", got, `{"turn_id":"turn-1"}`)
 	}
-	if got := req.Header.Get("X-Client-Request-Id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
+	if got := headerValueCaseInsensitive(req.Header, "x-client-request-id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
 		t.Fatalf("X-Client-Request-Id = %s, want %s", got, "019d2233-e240-7162-992d-38df0a2a0e0d")
 	}
 }
