@@ -825,7 +825,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	var identityState codexIdentityConfuseState
-	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, body)
+	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, body, opts)
 	if err != nil {
 		return resp, err
 	}
@@ -994,7 +994,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
 	var identityState codexIdentityConfuseState
-	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, body)
+	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, body, opts)
 	if err != nil {
 		return resp, err
 	}
@@ -1108,7 +1108,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	var identityState codexIdentityConfuseState
-	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, body)
+	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, body, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -1432,11 +1432,22 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 }
 
 type codexIdentityConfuseState struct {
+	managed                bool
 	enabled                bool
 	authID                 string
 	originalPromptCacheKey string
 	promptCacheKey         string
-	headerPromptCacheKey   string
+	sessionID              string
+	threadID               string
+	windowID               string
+	installationID         string
+	turnID                 string
+	parentThreadID         string
+	forkedFromThreadID     string
+	turnMetadata           string
+	requestIdentityID      string
+	identityIDs            []codexIdentityReplacement
+	installationIDs        []codexIdentityReplacement
 	turnIDs                []codexIdentityReplacement
 }
 
@@ -1445,7 +1456,7 @@ type codexIdentityReplacement struct {
 	confused string
 }
 
-func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, userPayload []byte, rawJSON []byte) (*http.Request, []byte, codexIdentityConfuseState, error) {
+func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, userPayload []byte, rawJSON []byte, requestOptions ...cliproxyexecutor.Options) (*http.Request, []byte, codexIdentityConfuseState, error) {
 	var cache helps.CodexCache
 	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
 		cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, req.Model, req.Payload, nil)
@@ -1470,11 +1481,23 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
 	}
 	var identityState codexIdentityConfuseState
-	rawJSON, identityState = applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, rawJSON)
-	if identityState.promptCacheKey != "" {
-		cache.ID = identityState.promptCacheKey
+	if codexShouldPairOAuthIdentity(auth, url) {
+		var opts cliproxyexecutor.Options
+		if len(requestOptions) > 0 {
+			opts = requestOptions[0]
+		}
+		rawJSON, identityState = applyCodexManagedIdentityBody(
+			e.cfg,
+			auth,
+			codexRequestHeaderSource(ctx, opts.Headers),
+			codexRequestIdentityID(req, opts),
+			userPayload,
+			rawJSON,
+		)
+		if codexOfficialBackendOperation(url) == codexOfficialCompactPath {
+			rawJSON, _ = sjson.DeleteBytes(rawJSON, "client_metadata")
+		}
 	}
-	identityState.headerPromptCacheKey = strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt_cache_key").String())
 	// Only the wire body is compressed; rawJSON remains plaintext for logging and
 	// accounting. Request-local state lets the final send step restore the matching
 	// Content-Encoding after custom headers and model overrides.
@@ -1487,70 +1510,179 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 }
 
 func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, userPayload []byte, rawJSON []byte) ([]byte, codexIdentityConfuseState) {
-	if !codexIdentityConfuseEnabled(cfg) || auth == nil || strings.TrimSpace(auth.ID) == "" || len(rawJSON) == 0 {
-		return rawJSON, codexIdentityConfuseState{}
+	return applyCodexManagedIdentityBody(cfg, auth, nil, newCodexRequestIdentityID(), userPayload, rawJSON)
+}
+
+func applyCodexManagedIdentityBody(cfg *config.Config, auth *cliproxyauth.Auth, sourceHeaders http.Header, requestIdentityID string, userPayload []byte, rawJSON []byte) ([]byte, codexIdentityConfuseState) {
+	authID := ""
+	if auth != nil {
+		authID = strings.TrimSpace(auth.ID)
+	}
+	state := codexIdentityConfuseState{
+		managed:           true,
+		authID:            authID,
+		requestIdentityID: strings.TrimSpace(requestIdentityID),
+	}
+	state.enabled = state.authID != "" && codexIdentityConfuseEnabled(cfg)
+
+	turnMetadataCandidates := []string{
+		strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.x-codex-turn-metadata").String()),
+		strings.TrimSpace(gjson.GetBytes(userPayload, "client_metadata.x-codex-turn-metadata").String()),
+		strings.TrimSpace(headerValueCaseInsensitive(sourceHeaders, "X-Codex-Turn-Metadata")),
+	}
+	turnMetadataValue := func(key string) string {
+		for _, metadata := range turnMetadataCandidates {
+			if value := strings.TrimSpace(gjson.Get(metadata, key).String()); value != "" {
+				return value
+			}
+		}
+		return ""
+	}
+	bodyValue := func(path string) string {
+		for _, payload := range [][]byte{rawJSON, userPayload} {
+			if value := strings.TrimSpace(gjson.GetBytes(payload, path).String()); value != "" {
+				return value
+			}
+		}
+		return ""
+	}
+	firstValue := func(values ...string) string {
+		for _, value := range values {
+			if value = strings.TrimSpace(value); value != "" {
+				return value
+			}
+		}
+		return ""
 	}
 
-	state := codexIdentityConfuseState{enabled: true, authID: strings.TrimSpace(auth.ID)}
-	if promptCacheKey := strings.TrimSpace(gjson.GetBytes(userPayload, "prompt_cache_key").String()); promptCacheKey != "" {
-		state.originalPromptCacheKey = promptCacheKey
-		state.promptCacheKey = codexIdentityConfuseUUID(auth.ID, "prompt-cache", promptCacheKey)
+	originalSessionID := firstValue(turnMetadataValue("session_id"), bodyValue("client_metadata.session_id"), codexSessionHeaderValue(sourceHeaders))
+	originalThreadID := firstValue(turnMetadataValue("thread_id"), bodyValue("client_metadata.thread_id"), codexThreadHeaderValue(sourceHeaders))
+	if originalSessionID == "" && originalThreadID == "" {
+		originalSessionID = state.requestIdentityID
+		originalThreadID = state.requestIdentityID
+	} else if originalSessionID == "" {
+		originalSessionID = originalThreadID
+	} else if originalThreadID == "" {
+		originalThreadID = originalSessionID
+	}
+	state.sessionID, state.threadID = state.confuseSessionThread(originalSessionID, originalThreadID)
+
+	originalPromptCacheKey := bodyValue("prompt_cache_key")
+	state.originalPromptCacheKey = originalPromptCacheKey
+	switch {
+	case originalPromptCacheKey == "":
+		state.promptCacheKey = state.threadID
+	case originalPromptCacheKey == originalThreadID:
+		state.promptCacheKey = state.threadID
+	default:
+		state.promptCacheKey = state.confuseIdentity("prompt-cache", originalPromptCacheKey)
+	}
+
+	originalInstallationID := firstValue(turnMetadataValue("installation_id"), bodyValue("client_metadata.x-codex-installation-id"), headerValueCaseInsensitive(sourceHeaders, "X-Codex-Installation-Id"))
+	state.installationID = state.confuseInstallationID(originalInstallationID)
+	originalTurnID := firstValue(turnMetadataValue("turn_id"), bodyValue("client_metadata.turn_id"))
+	state.turnID = state.confuseTurnID(originalTurnID)
+	originalParentThreadID := firstValue(turnMetadataValue("parent_thread_id"), bodyValue("client_metadata.x-codex-parent-thread-id"), headerValueCaseInsensitive(sourceHeaders, "X-Codex-Parent-Thread-Id"))
+	state.parentThreadID = state.confuseIdentity("thread", originalParentThreadID)
+	originalForkedFromThreadID := turnMetadataValue("forked_from_thread_id")
+	state.forkedFromThreadID = state.confuseIdentity("thread", originalForkedFromThreadID)
+	originalWindowID := firstValue(turnMetadataValue("window_id"), bodyValue("client_metadata.x-codex-window-id"), headerValueCaseInsensitive(sourceHeaders, "X-Codex-Window-Id"))
+	originalWindowID = normalizeCodexWindowID(originalWindowID, originalThreadID)
+	state.windowID = state.confuseWindowID(originalWindowID)
+
+	if state.promptCacheKey != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", state.promptCacheKey)
 	}
-	if installationID := strings.TrimSpace(gjson.GetBytes(userPayload, "client_metadata.x-codex-installation-id").String()); installationID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-installation-id", codexIdentityConfuseUUID(auth.ID, "installation", installationID))
-	}
-	if turnMetadata := strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.x-codex-turn-metadata").String()); turnMetadata != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-turn-metadata", applyCodexTurnMetadataIdentityConfuse(turnMetadata, &state))
-	}
-	if state.promptCacheKey != "" {
-		if windowID := strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.x-codex-window-id").String()); windowID != "" {
-			rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-window-id", state.promptCacheKey+":0")
+	for _, field := range []struct {
+		path  string
+		value string
+	}{
+		{path: "client_metadata.x-codex-installation-id", value: state.installationID},
+		{path: "client_metadata.session_id", value: state.sessionID},
+		{path: "client_metadata.thread_id", value: state.threadID},
+		{path: "client_metadata.turn_id", value: state.turnID},
+		{path: "client_metadata.x-codex-window-id", value: state.windowID},
+		{path: "client_metadata.x-codex-parent-thread-id", value: state.parentThreadID},
+	} {
+		if field.value != "" {
+			rawJSON, _ = sjson.SetBytes(rawJSON, field.path, field.value)
 		}
 	}
 
+	state.turnMetadata = firstValue(turnMetadataCandidates...)
+	if state.turnMetadata != "" {
+		state.turnMetadata = projectCodexTurnMetadata(state.turnMetadata, state)
+		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-turn-metadata", state.turnMetadata)
+	}
 	return rawJSON, state
 }
 
-func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityConfuseState) {
-	if headers == nil {
-		return
+func normalizeCodexWindowID(windowID string, threadID string) string {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return strings.TrimSpace(windowID)
 	}
-	if state == nil || !state.enabled {
-		return
+	windowID = strings.TrimSpace(windowID)
+	if index := strings.LastIndex(windowID, ":"); index > 0 && index < len(windowID)-1 {
+		return threadID + windowID[index:]
 	}
-
-	if rawTurnMetadata := strings.TrimSpace(headers.Get("X-Codex-Turn-Metadata")); rawTurnMetadata != "" {
-		headers.Set("X-Codex-Turn-Metadata", applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata, state))
-	}
-	if state.promptCacheKey == "" {
-		return
-	}
-
-	headers.Set("X-Codex-Window-Id", state.promptCacheKey+":0")
+	return threadID + ":0"
 }
 
-func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexIdentityConfuseState) string {
-	updatedTurnMetadata := rawTurnMetadata
-	if state == nil || !state.enabled {
-		return updatedTurnMetadata
+func projectCodexTurnMetadata(rawTurnMetadata string, state codexIdentityConfuseState) string {
+	updated := rawTurnMetadata
+	for _, field := range []struct {
+		path  string
+		value string
+	}{
+		{path: "installation_id", value: state.installationID},
+		{path: "session_id", value: state.sessionID},
+		{path: "thread_id", value: state.threadID},
+		{path: "turn_id", value: state.turnID},
+		{path: "window_id", value: state.windowID},
+		{path: "forked_from_thread_id", value: state.forkedFromThreadID},
+		{path: "parent_thread_id", value: state.parentThreadID},
+	} {
+		if field.value != "" {
+			updated, _ = sjson.Set(updated, field.path, field.value)
+		}
 	}
 	if state.promptCacheKey != "" && gjson.Get(rawTurnMetadata, "prompt_cache_key").Exists() {
-		updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "prompt_cache_key", state.promptCacheKey)
-	} else if state.promptCacheKey != "" && state.originalPromptCacheKey != "" {
-		updatedTurnMetadata = strings.ReplaceAll(updatedTurnMetadata, state.originalPromptCacheKey, state.promptCacheKey)
+		updated, _ = sjson.Set(updated, "prompt_cache_key", state.promptCacheKey)
 	}
-	if turnID := strings.TrimSpace(gjson.Get(rawTurnMetadata, "turn_id").String()); turnID != "" {
-		updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "turn_id", state.confuseTurnID(turnID))
+	return updated
+}
+
+func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityConfuseState) {
+	if headers == nil || state == nil || !state.managed {
+		return
 	}
-	if state.promptCacheKey != "" && gjson.Get(rawTurnMetadata, "window_id").Exists() {
-		updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "window_id", state.promptCacheKey+":0")
+	setCodexSessionThreadHeaders(headers, state.sessionID, state.threadID)
+	setCodexClientRequestID(headers, state.threadID)
+	for _, field := range []struct {
+		key   string
+		value string
+	}{
+		{key: "X-Codex-Installation-Id", value: state.installationID},
+		{key: "X-Codex-Window-Id", value: state.windowID},
+		{key: "X-Codex-Parent-Thread-Id", value: state.parentThreadID},
+		{key: "X-Codex-Turn-Metadata", value: state.turnMetadata},
+	} {
+		deleteHeaderCaseInsensitive(headers, field.key)
+		if field.value != "" {
+			setHeaderCasePreserved(headers, field.key, field.value)
+		}
 	}
-	return updatedTurnMetadata
 }
 
 func applyCodexIdentityConfuseResponsePayload(payload []byte, state codexIdentityConfuseState) []byte {
 	payload = replaceCodexIdentityResponsePayload(payload, state.originalPromptCacheKey, state.promptCacheKey)
+	for _, identityID := range state.identityIDs {
+		payload = replaceCodexIdentityResponsePayload(payload, identityID.original, identityID.confused)
+	}
+	for _, installationID := range state.installationIDs {
+		payload = replaceCodexIdentityResponsePayload(payload, installationID.original, installationID.confused)
+	}
 	for _, turnID := range state.turnIDs {
 		payload = replaceCodexIdentityResponsePayload(payload, turnID.original, turnID.confused)
 	}
@@ -1559,6 +1691,12 @@ func applyCodexIdentityConfuseResponsePayload(payload []byte, state codexIdentit
 
 func applyCodexIdentityExposeResponsePayload(payload []byte, state codexIdentityConfuseState) []byte {
 	payload = replaceCodexIdentityResponsePayload(payload, state.promptCacheKey, state.originalPromptCacheKey)
+	for _, identityID := range state.identityIDs {
+		payload = replaceCodexIdentityResponsePayload(payload, identityID.confused, identityID.original)
+	}
+	for _, installationID := range state.installationIDs {
+		payload = replaceCodexIdentityResponsePayload(payload, installationID.confused, installationID.original)
+	}
 	for _, turnID := range state.turnIDs {
 		payload = replaceCodexIdentityResponsePayload(payload, turnID.confused, turnID.original)
 	}
@@ -1578,6 +1716,66 @@ func (state *codexIdentityConfuseState) confuseTurnID(turnID string) string {
 	confusedTurnID := codexIdentityConfuseUUID(state.authID, "turn", turnID)
 	state.turnIDs = append(state.turnIDs, codexIdentityReplacement{original: turnID, confused: confusedTurnID})
 	return confusedTurnID
+}
+
+func (state *codexIdentityConfuseState) confuseIdentity(kind string, value string) string {
+	value = strings.TrimSpace(value)
+	if state == nil || !state.enabled || strings.TrimSpace(state.authID) == "" || value == "" {
+		return value
+	}
+	for _, replacement := range state.identityIDs {
+		if replacement.original == value || replacement.confused == value {
+			return replacement.confused
+		}
+	}
+	confused := codexIdentityConfuseUUID(state.authID, kind, value)
+	state.identityIDs = append(state.identityIDs, codexIdentityReplacement{original: value, confused: confused})
+	return confused
+}
+
+func (state *codexIdentityConfuseState) confuseSessionThread(sessionID string, threadID string) (string, string) {
+	sessionID = strings.TrimSpace(sessionID)
+	threadID = strings.TrimSpace(threadID)
+	if sessionID != "" && sessionID == threadID {
+		confused := state.confuseIdentity("thread", threadID)
+		return confused, confused
+	}
+	if sessionID != "" {
+		sessionID = state.confuseIdentity("session", sessionID)
+	}
+	if threadID != "" {
+		threadID = state.confuseIdentity("thread", threadID)
+	}
+	return sessionID, threadID
+}
+
+func (state *codexIdentityConfuseState) confuseInstallationID(value string) string {
+	value = strings.TrimSpace(value)
+	if state == nil || !state.enabled || strings.TrimSpace(state.authID) == "" || value == "" {
+		return value
+	}
+	for _, replacement := range state.installationIDs {
+		if replacement.original == value || replacement.confused == value {
+			return replacement.confused
+		}
+	}
+	confused := codexIdentityConfuseUUID(state.authID, "installation", value)
+	state.installationIDs = append(state.installationIDs, codexIdentityReplacement{original: value, confused: confused})
+	return confused
+}
+
+func (state *codexIdentityConfuseState) confuseWindowID(windowID string) string {
+	windowID = strings.TrimSpace(windowID)
+	if state == nil || !state.enabled || windowID == "" {
+		return windowID
+	}
+	prefix := windowID
+	suffix := ""
+	if index := strings.LastIndex(windowID, ":"); index > 0 && index < len(windowID)-1 {
+		prefix = windowID[:index]
+		suffix = windowID[index:]
+	}
+	return state.confuseIdentity("thread", prefix) + suffix
 }
 
 func replaceCodexIdentityResponsePayload(payload []byte, from string, to string) []byte {
@@ -1602,6 +1800,32 @@ func codexIdentityConfuseUUID(authID string, kind string, value string) string {
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String()
 }
 
+func newCodexRequestIdentityID() string {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return ""
+	}
+	return id.String()
+}
+
+func codexRequestIdentityID(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
+	for _, metadata := range []map[string]any{opts.Metadata, req.Metadata} {
+		if value := metadataString(metadata, cliproxyexecutor.CodexRequestIdentityMetadataKey); value != "" {
+			return value
+		}
+	}
+	identityID := newCodexRequestIdentityID()
+	if identityID == "" {
+		return ""
+	}
+	for _, metadata := range []map[string]any{opts.Metadata, req.Metadata} {
+		if metadata != nil {
+			metadata[cliproxyexecutor.CodexRequestIdentityMetadataKey] = identityID
+		}
+	}
+	return identityID
+}
+
 func codexRequestHeaderSource(ctx context.Context, explicitHeaders http.Header) http.Header {
 	if explicitHeaders != nil {
 		return explicitHeaders
@@ -1620,7 +1844,7 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	sourceHeaders := codexRequestHeaderSource(r.Context(), nil)
 	pairOAuthIdentity := codexShouldPairOAuthIdentity(auth, r.URL.String())
 	applyCodexHeadersFromSources(r, auth, token, stream, cfg, sourceHeaders, pairOAuthIdentity)
-	finalizeCodexRequestHeaders(r.Header, sourceHeaders, "", pairOAuthIdentity, codexFallbackUserAgent(auth, cfg))
+	finalizeCodexRequestHeaders(r.Header, sourceHeaders, "", pairOAuthIdentity, codexShouldPairClientRequestID(r.URL.String()), pairOAuthIdentity, codexFallbackUserAgent(auth, cfg))
 	finalizeCodexContentEncoding(r)
 	observeCodexFingerprint(cfg, auth, r)
 }
@@ -1633,12 +1857,13 @@ func applyCodexManagedRequestHeaders(r *http.Request, auth *cliproxyauth.Auth, t
 	pairOAuthIdentity := codexShouldPairOAuthIdentity(auth, r.URL.String())
 	applyCodexHeadersFromSources(r, auth, token, stream, cfg, sourceHeaders, pairOAuthIdentity)
 	applyModelHeaderOverrides(r.Header, modelName)
+	primeCodexRequestIdentityHeaders(r.Header, sourceHeaders)
 	applyCodexIdentityConfuseHeaders(r.Header, identityState)
-	promptCacheFallback := ""
+	requestIdentityFallback := ""
 	if identityState != nil {
-		promptCacheFallback = identityState.headerPromptCacheKey
+		requestIdentityFallback = identityState.requestIdentityID
 	}
-	finalizeCodexRequestHeaders(r.Header, sourceHeaders, promptCacheFallback, pairOAuthIdentity, codexFallbackUserAgent(auth, cfg))
+	finalizeCodexRequestHeaders(r.Header, sourceHeaders, requestIdentityFallback, pairOAuthIdentity, codexShouldPairClientRequestID(r.URL.String()), pairOAuthIdentity, codexFallbackUserAgent(auth, cfg))
 	finalizeCodexContentEncoding(r)
 	observeCodexFingerprint(cfg, auth, r)
 }
@@ -1661,17 +1886,43 @@ func applyModelHeaderOverrides(headers http.Header, modelName string) {
 // the other managed Codex paths while retaining the direct image content policy.
 func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, modelName string, explicitHeaders http.Header, identityState *codexIdentityConfuseState) {
 	sourceHeaders := codexRequestHeaderSource(r.Context(), explicitHeaders)
+	normalizeOAuthClient := codexShouldNormalizeOAuthClientIdentity(auth, r.URL.String())
 	pairOAuthIdentity := codexShouldPairOAuthIdentity(auth, r.URL.String())
-	applyCodexHeadersFromSources(r, auth, token, stream, cfg, sourceHeaders, pairOAuthIdentity)
-	applyModelHeaderOverrides(r.Header, modelName)
-	applyCodexIdentityConfuseHeaders(r.Header, identityState)
-	promptCacheFallback := ""
-	if identityState != nil {
-		promptCacheFallback = identityState.headerPromptCacheKey
+	if normalizeOAuthClient && !pairOAuthIdentity {
+		sourceHeaders = sourceHeaders.Clone()
+		removeCodexResponsesIdentityHeaders(sourceHeaders)
 	}
-	finalizeCodexRequestHeaders(r.Header, sourceHeaders, promptCacheFallback, pairOAuthIdentity, codexFallbackUserAgent(auth, cfg))
+	applyCodexHeadersFromSources(r, auth, token, stream, cfg, sourceHeaders, normalizeOAuthClient)
+	applyModelHeaderOverrides(r.Header, modelName)
+	primeCodexRequestIdentityHeaders(r.Header, sourceHeaders)
+	applyCodexIdentityConfuseHeaders(r.Header, identityState)
+	if normalizeOAuthClient && !pairOAuthIdentity {
+		removeCodexResponsesIdentityHeaders(r.Header)
+	}
+	requestIdentityFallback := ""
+	if identityState != nil {
+		requestIdentityFallback = identityState.requestIdentityID
+	}
+	finalizeCodexRequestHeaders(r.Header, sourceHeaders, requestIdentityFallback, pairOAuthIdentity, codexShouldPairClientRequestID(r.URL.String()), normalizeOAuthClient, codexFallbackUserAgent(auth, cfg))
 	finalizeCodexContentEncoding(r)
 	observeCodexFingerprint(cfg, auth, r)
+}
+
+func removeCodexResponsesIdentityHeaders(headers http.Header) {
+	if headers == nil {
+		return
+	}
+	setCodexSessionThreadHeaders(headers, "", "")
+	setCodexClientRequestID(headers, "")
+	for _, key := range []string{
+		"X-Codex-Installation-Id",
+		"X-Codex-Window-Id",
+		"X-Codex-Parent-Thread-Id",
+		"X-Codex-Turn-Metadata",
+		"X-Codex-Turn-State",
+	} {
+		deleteHeaderCaseInsensitive(headers, key)
+	}
 }
 
 func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, sourceHeaders http.Header, pairOAuthIdentity bool) {

@@ -37,6 +37,10 @@ const (
 	SelectedAuthCallbackMetadataKey = "selected_auth_callback"
 	// ExecutionSessionMetadataKey identifies a long-lived downstream execution session.
 	ExecutionSessionMetadataKey = "execution_session_id"
+	// CodexRequestIdentityMetadataKey stores the request-scoped UUID used when an
+	// official Codex OAuth request arrives without client session/thread IDs. The
+	// shared metadata map keeps the UUID stable across retries and WS-to-HTTP fallback.
+	CodexRequestIdentityMetadataKey = "codex_request_identity"
 )
 
 // Request encapsulates the translated payload that will be sent to a provider executor.
