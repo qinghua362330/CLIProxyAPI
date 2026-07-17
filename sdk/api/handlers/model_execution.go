@@ -196,7 +196,7 @@ func modelExecutionResponseProtocol(entryProtocol, exitProtocol string) string {
 }
 
 func modelExecutionHeaders(ctx context.Context, headers http.Header) http.Header {
-	if headers != nil {
+	if len(headers) > 0 {
 		return cloneHeader(headers)
 	}
 	return headersFromContext(ctx)

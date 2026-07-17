@@ -31,11 +31,10 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	}
 	url := "https://example.com/responses"
 
-	httpReq, _, identityState, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, nil, req, req.Payload, rawJSON)
+	httpReq, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, nil, req, req.Payload, rawJSON)
 	if err != nil {
 		t.Fatalf("cacheHelper error: %v", err)
 	}
-	applyCodexManagedRequestHeaders(httpReq, nil, "", true, nil, req.Model, nil, &identityState)
 
 	body, errRead := io.ReadAll(httpReq.Body)
 	if errRead != nil {
@@ -50,11 +49,11 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	if gotConversation := httpReq.Header.Get("Conversation_id"); gotConversation != "" {
 		t.Fatalf("Conversation_id = %q, want empty", gotConversation)
 	}
-	if gotSession := httpReq.Header["session-id"]; len(gotSession) != 0 {
-		t.Fatalf("custom upstream session-id = %#v, want absent", gotSession)
+	if gotSession := httpReq.Header["session-id"]; len(gotSession) != 1 || gotSession[0] != expectedKey {
+		t.Fatalf("session-id = %#v, want [%q]", gotSession, expectedKey)
 	}
-	if gotThread := httpReq.Header["thread-id"]; len(gotThread) != 0 {
-		t.Fatalf("custom upstream thread-id = %#v, want absent", gotThread)
+	if gotThread := httpReq.Header["thread-id"]; len(gotThread) != 1 || gotThread[0] != expectedKey {
+		t.Fatalf("thread-id = %#v, want [%q]", gotThread, expectedKey)
 	}
 	if gotUnderscore := httpReq.Header["Session_id"]; len(gotUnderscore) != 0 {
 		t.Fatalf("Session_id (underscore) = %#v, want absent", gotUnderscore)
@@ -99,16 +98,14 @@ func TestCodexExecutorCacheHelper_ClaudeUsesClaudeCodeSessionID(t *testing.T) {
 		}`),
 	}
 
-	firstHTTPReq, _, firstIdentityState, err := executor.cacheHelper(ctx, sdktranslator.FromString("claude"), url, nil, firstReq, firstReq.Payload, rawJSON)
+	firstHTTPReq, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("claude"), url, nil, firstReq, firstReq.Payload, rawJSON)
 	if err != nil {
 		t.Fatalf("cacheHelper first error: %v", err)
 	}
-	secondHTTPReq, _, secondIdentityState, err := executor.cacheHelper(ctx, sdktranslator.FromString("claude"), url, nil, secondReq, secondReq.Payload, rawJSON)
+	secondHTTPReq, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("claude"), url, nil, secondReq, secondReq.Payload, rawJSON)
 	if err != nil {
 		t.Fatalf("cacheHelper second error: %v", err)
 	}
-	applyCodexManagedRequestHeaders(firstHTTPReq, nil, "", true, nil, firstReq.Model, nil, &firstIdentityState)
-	applyCodexManagedRequestHeaders(secondHTTPReq, nil, "", true, nil, secondReq.Model, nil, &secondIdentityState)
 
 	firstBody, errRead := io.ReadAll(firstHTTPReq.Body)
 	if errRead != nil {
@@ -126,14 +123,14 @@ func TestCodexExecutorCacheHelper_ClaudeUsesClaudeCodeSessionID(t *testing.T) {
 	if secondKey != firstKey {
 		t.Fatalf("same Claude Code session_id produced different prompt_cache_key: first=%q second=%q", firstKey, secondKey)
 	}
-	if gotSession := firstHTTPReq.Header["session-id"]; len(gotSession) != 0 {
-		t.Fatalf("custom upstream first session-id = %#v, want absent", gotSession)
+	if gotSession := firstHTTPReq.Header["session-id"]; len(gotSession) != 1 || gotSession[0] != firstKey {
+		t.Fatalf("first session-id = %#v, want [%q]", gotSession, firstKey)
 	}
-	if gotThread := firstHTTPReq.Header["thread-id"]; len(gotThread) != 0 {
-		t.Fatalf("custom upstream first thread-id = %#v, want absent", gotThread)
+	if gotThread := firstHTTPReq.Header["thread-id"]; len(gotThread) != 1 || gotThread[0] != firstKey {
+		t.Fatalf("first thread-id = %#v, want [%q]", gotThread, firstKey)
 	}
-	if gotSession := secondHTTPReq.Header["session-id"]; len(gotSession) != 0 {
-		t.Fatalf("custom upstream second session-id = %#v, want absent", gotSession)
+	if gotSession := secondHTTPReq.Header["session-id"]; len(gotSession) != 1 || gotSession[0] != firstKey {
+		t.Fatalf("second session-id = %#v, want [%q]", gotSession, firstKey)
 	}
 }
 
@@ -170,31 +167,28 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	ginCtx.Request = httptest.NewRequest("POST", "/v1/responses", nil)
 	ginCtx.Request.Header.Set("X-Codex-Turn-Metadata", `{"prompt_cache_key":"cache-1","turn_id":"turn-1","window_id":"cache-1:0"}`)
 	ginCtx.Request.Header.Set("X-Client-Request-Id", "client-request-1")
-	ginCtx.Request.Header.Set("session-id", "session-1")
-	ginCtx.Request.Header.Set("thread-id", "cache-1")
 
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
 	executor := &CodexExecutor{cfg: &config.Config{
 		Routing: config.RoutingConfig{Strategy: "fill-first"},
 		Codex:   config.CodexConfig{IdentityConfuse: true},
 	}}
-	auth := &cliproxyauth.Auth{ID: "auth-1", Provider: "codex", Metadata: map[string]any{"access_token": "oauth-token"}}
+	auth := &cliproxyauth.Auth{ID: "auth-1", Provider: "codex"}
 	rawJSON := []byte(`{"model":"gpt-5-codex","stream":true,"client_metadata":{"x-codex-turn-metadata":"{\"prompt_cache_key\":\"cache-1\",\"turn_id\":\"turn-1\",\"window_id\":\"cache-1:0\"}","x-codex-window-id":"cache-1:0"}}`)
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5-codex",
 		Payload: []byte(`{"model":"gpt-5-codex","prompt_cache_key":"cache-1","client_metadata":{"x-codex-installation-id":"install-1"}}`),
 	}
-	url := "https://chatgpt.com" + codexOfficialResponsesPath
+	url := "https://example.com/responses"
 
 	httpReq, body, identityState, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai-response"), url, auth, req, req.Payload, rawJSON)
 	if err != nil {
 		t.Fatalf("cacheHelper error: %v", err)
 	}
-	applyCodexManagedRequestHeaders(httpReq, auth, "oauth-token", true, executor.cfg, req.Model, nil, &identityState)
+	applyCodexHeaders(httpReq, auth, "oauth-token", true, executor.cfg)
+	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 
-	expectedThreadID := codexIdentityConfuseUUID("auth-1", "thread", "cache-1")
-	expectedPromptCacheKey := expectedThreadID
-	expectedSessionID := codexIdentityConfuseUUID("auth-1", "session", "session-1")
+	expectedPromptCacheKey := codexIdentityConfuseUUID("auth-1", "prompt-cache", "cache-1")
 	expectedTurnID := codexIdentityConfuseUUID("auth-1", "turn", "turn-1")
 	if gotKey := gjson.GetBytes(body, "prompt_cache_key").String(); gotKey != expectedPromptCacheKey {
 		t.Fatalf("prompt_cache_key = %q, want %q", gotKey, expectedPromptCacheKey)
@@ -216,14 +210,14 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	if gotWindowID := gjson.GetBytes(body, "client_metadata.x-codex-window-id").String(); gotWindowID != expectedPromptCacheKey+":0" {
 		t.Fatalf("client_metadata.x-codex-window-id = %q, want %q", gotWindowID, expectedPromptCacheKey+":0")
 	}
-	if gotHeader := httpReq.Header["session-id"]; len(gotHeader) != 1 || gotHeader[0] != expectedSessionID {
-		t.Fatalf("session-id = %#v, want [%q]", gotHeader, expectedSessionID)
+	if gotHeader := httpReq.Header["session-id"]; len(gotHeader) != 1 || gotHeader[0] != expectedPromptCacheKey {
+		t.Fatalf("session-id = %#v, want [%q]", gotHeader, expectedPromptCacheKey)
 	}
-	if gotHeader := httpReq.Header["thread-id"]; len(gotHeader) != 1 || gotHeader[0] != expectedThreadID {
-		t.Fatalf("thread-id = %#v, want [%q]", gotHeader, expectedThreadID)
+	if gotHeader := httpReq.Header["thread-id"]; len(gotHeader) != 1 || gotHeader[0] != expectedPromptCacheKey {
+		t.Fatalf("thread-id = %#v, want [%q]", gotHeader, expectedPromptCacheKey)
 	}
-	if gotHeader := headerValueCaseInsensitive(httpReq.Header, "x-client-request-id"); gotHeader != expectedThreadID {
-		t.Fatalf("x-client-request-id = %q, want confused thread %q", gotHeader, expectedThreadID)
+	if gotHeader := httpReq.Header.Get("X-Client-Request-Id"); gotHeader != expectedPromptCacheKey {
+		t.Fatalf("X-Client-Request-Id = %q, want %q", gotHeader, expectedPromptCacheKey)
 	}
 	if gotCanonicalSession := httpReq.Header.Get("Session-Id"); gotCanonicalSession != "" {
 		t.Fatalf("Session-Id = %q, want empty", gotCanonicalSession)
