@@ -1452,6 +1452,7 @@ type codexIdentityConfuseState struct {
 }
 
 type codexIdentityReplacement struct {
+	kind     string
 	original string
 	confused string
 }
@@ -1490,7 +1491,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 			e.cfg,
 			auth,
 			codexRequestHeaderSource(ctx, opts.Headers),
-			codexRequestIdentityID(req, opts),
+			codexRequestIdentityID(req, &opts),
 			userPayload,
 			rawJSON,
 		)
@@ -1724,12 +1725,12 @@ func (state *codexIdentityConfuseState) confuseIdentity(kind string, value strin
 		return value
 	}
 	for _, replacement := range state.identityIDs {
-		if replacement.original == value || replacement.confused == value {
+		if replacement.kind == kind && (replacement.original == value || replacement.confused == value) {
 			return replacement.confused
 		}
 	}
 	confused := codexIdentityConfuseUUID(state.authID, kind, value)
-	state.identityIDs = append(state.identityIDs, codexIdentityReplacement{original: value, confused: confused})
+	state.identityIDs = append(state.identityIDs, codexIdentityReplacement{kind: kind, original: value, confused: confused})
 	return confused
 }
 
@@ -1808,8 +1809,12 @@ func newCodexRequestIdentityID() string {
 	return id.String()
 }
 
-func codexRequestIdentityID(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
-	for _, metadata := range []map[string]any{opts.Metadata, req.Metadata} {
+func codexRequestIdentityID(req cliproxyexecutor.Request, opts *cliproxyexecutor.Options) string {
+	var optsMetadata map[string]any
+	if opts != nil {
+		optsMetadata = opts.Metadata
+	}
+	for _, metadata := range []map[string]any{optsMetadata, req.Metadata} {
 		if value := metadataString(metadata, cliproxyexecutor.CodexRequestIdentityMetadataKey); value != "" {
 			return value
 		}
@@ -1818,7 +1823,11 @@ func codexRequestIdentityID(req cliproxyexecutor.Request, opts cliproxyexecutor.
 	if identityID == "" {
 		return ""
 	}
-	for _, metadata := range []map[string]any{opts.Metadata, req.Metadata} {
+	if opts != nil && opts.Metadata == nil {
+		opts.Metadata = make(map[string]any)
+		optsMetadata = opts.Metadata
+	}
+	for _, metadata := range []map[string]any{optsMetadata, req.Metadata} {
 		if metadata != nil {
 			metadata[cliproxyexecutor.CodexRequestIdentityMetadataKey] = identityID
 		}
