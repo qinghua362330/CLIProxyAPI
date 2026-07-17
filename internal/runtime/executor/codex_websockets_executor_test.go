@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -230,6 +231,15 @@ func TestCodexWebsocketsExecuteStreamUnlocksSessionBeforeHTTPFallback(t *testing
 		clientRequestID string
 	}
 	captured := make(chan capturedRequest, 4)
+	firstHTTPStarted := make(chan struct{})
+	releaseFirstHTTP := make(chan struct{}, 1)
+	defer func() {
+		select {
+		case releaseFirstHTTP <- struct{}{}:
+		default:
+		}
+	}()
+	var httpRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		transport := "http"
 		if websocket.IsWebSocketUpgrade(r) {
@@ -242,6 +252,10 @@ func TestCodexWebsocketsExecuteStreamUnlocksSessionBeforeHTTPFallback(t *testing
 		if transport == "websocket" {
 			w.WriteHeader(http.StatusUpgradeRequired)
 			return
+		}
+		if httpRequests.Add(1) == 1 {
+			close(firstHTTPStarted)
+			<-releaseFirstHTTP
 		}
 
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -277,33 +291,157 @@ func TestCodexWebsocketsExecuteStreamUnlocksSessionBeforeHTTPFallback(t *testing
 		}
 		return nil
 	}
-	if err := run(); err != nil {
-		t.Fatalf("first ExecuteStream() error = %v", err)
+	assertRequest := func(index int, wantTransport string) {
+		t.Helper()
+		select {
+		case got := <-captured:
+			if got.transport != wantTransport {
+				t.Fatalf("request %d transport = %q, want %q", index, got.transport, wantTransport)
+			}
+			if got.clientRequestID != requestIdentity {
+				t.Fatalf("request %d X-Client-Request-Id = %q, want stable %q", index, got.clientRequestID, requestIdentity)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for request %d (%s)", index, wantTransport)
+		}
 	}
 
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- run() }()
+	assertRequest(1, "websocket")
+	assertRequest(2, "http")
+	select {
+	case <-firstHTTPStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first HTTP fallback did not start")
+	}
 	secondDone := make(chan error, 1)
 	go func() { secondDone <- run() }()
+	assertRequest(3, "websocket")
+	assertRequest(4, "http")
+	releaseFirstHTTP <- struct{}{}
+
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first ExecuteStream() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first ExecuteStream() did not complete after releasing HTTP fallback")
+	}
 	select {
 	case err := <-secondDone:
 		if err != nil {
 			t.Fatalf("second ExecuteStream() error = %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("second ExecuteStream() blocked after first websocket handshake fallback")
+		t.Fatal("second ExecuteStream() did not complete")
+	}
+}
+
+func TestCodexWebsocketsExecuteUnlocksSessionBeforeHTTPFallback(t *testing.T) {
+	type capturedRequest struct {
+		transport       string
+		clientRequestID string
+	}
+	captured := make(chan capturedRequest, 4)
+	firstHTTPStarted := make(chan struct{})
+	releaseFirstHTTP := make(chan struct{}, 1)
+	defer func() {
+		select {
+		case releaseFirstHTTP <- struct{}{}:
+		default:
+		}
+	}()
+	var httpRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		transport := "http"
+		if websocket.IsWebSocketUpgrade(r) {
+			transport = "websocket"
+		}
+		captured <- capturedRequest{
+			transport:       transport,
+			clientRequestID: headerValueCaseInsensitive(r.Header, "x-client-request-id"),
+		}
+		if transport == "websocket" {
+			w.WriteHeader(http.StatusUpgradeRequired)
+			return
+		}
+		if httpRequests.Add(1) == 1 {
+			close(firstHTTPStarted)
+			<-releaseFirstHTTP
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`),
+	}
+	const requestIdentity = "request-identity-stable"
+	opts := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FromString("openai-response"),
+		ResponseFormat: sdktranslator.FromString("openai-response"),
+		Headers:        http.Header{"X-Client-Request-Id": []string{requestIdentity}},
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: t.Name(),
+		},
 	}
 
-	for i, wantTransport := range []string{"websocket", "http", "websocket", "http"} {
+	run := func() error {
+		_, err := exec.Execute(context.Background(), auth, req, opts)
+		return err
+	}
+	assertRequest := func(index int, wantTransport string) {
+		t.Helper()
 		select {
 		case got := <-captured:
 			if got.transport != wantTransport {
-				t.Fatalf("request %d transport = %q, want %q", i+1, got.transport, wantTransport)
+				t.Fatalf("request %d transport = %q, want %q", index, got.transport, wantTransport)
 			}
 			if got.clientRequestID != requestIdentity {
-				t.Fatalf("request %d X-Client-Request-Id = %q, want stable %q", i+1, got.clientRequestID, requestIdentity)
+				t.Fatalf("request %d X-Client-Request-Id = %q, want stable %q", index, got.clientRequestID, requestIdentity)
 			}
 		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for request %d", i+1)
+			t.Fatalf("timed out waiting for request %d (%s)", index, wantTransport)
 		}
+	}
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- run() }()
+	assertRequest(1, "websocket")
+	assertRequest(2, "http")
+	select {
+	case <-firstHTTPStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first HTTP fallback did not start")
+	}
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- run() }()
+	assertRequest(3, "websocket")
+	assertRequest(4, "http")
+	releaseFirstHTTP <- struct{}{}
+
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first Execute() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first Execute() did not complete after releasing HTTP fallback")
+	}
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second Execute() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Execute() did not complete")
 	}
 }
 

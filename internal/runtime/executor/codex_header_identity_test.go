@@ -416,16 +416,66 @@ func TestCodexManagedIdentityKeepsPromptOverrideSeparateFromGeneratedRequestIden
 }
 
 func TestCodexRequestIdentityIDStableAcrossRetries(t *testing.T) {
-	metadata := map[string]any{}
-	req := cliproxyexecutor.Request{Metadata: metadata}
-	first := codexRequestIdentityID(req, cliproxyexecutor.Options{})
-	second := codexRequestIdentityID(req, cliproxyexecutor.Options{})
-	if first == "" || second != first {
-		t.Fatalf("request identity changed across retries: first=%q second=%q", first, second)
+	assertStable := func(t *testing.T, req cliproxyexecutor.Request, opts *cliproxyexecutor.Options, stored func() string) {
+		t.Helper()
+		first := codexRequestIdentityID(req, opts)
+		second := codexRequestIdentityID(req, opts)
+		if first == "" || second != first {
+			t.Fatalf("request identity changed across retries: first=%q second=%q", first, second)
+		}
+		if got := stored(); got != first {
+			t.Fatalf("stored request identity = %q, want %q", got, first)
+		}
+		parsed, err := uuid.Parse(first)
+		if err != nil || parsed.Version() != 7 {
+			t.Fatalf("request identity = %q, want UUIDv7 (err=%v)", first, err)
+		}
 	}
-	parsed, err := uuid.Parse(first)
-	if err != nil || parsed.Version() != 7 {
-		t.Fatalf("request identity = %q, want UUIDv7 (err=%v)", first, err)
+
+	t.Run("allocates options metadata", func(t *testing.T) {
+		req := cliproxyexecutor.Request{}
+		opts := &cliproxyexecutor.Options{}
+		assertStable(t, req, opts, func() string {
+			return metadataString(opts.Metadata, cliproxyexecutor.CodexRequestIdentityMetadataKey)
+		})
+	})
+
+	t.Run("preserves request metadata", func(t *testing.T) {
+		metadata := map[string]any{}
+		req := cliproxyexecutor.Request{Metadata: metadata}
+		opts := &cliproxyexecutor.Options{}
+		assertStable(t, req, opts, func() string {
+			return metadataString(metadata, cliproxyexecutor.CodexRequestIdentityMetadataKey)
+		})
+	})
+}
+
+func TestCodexManagedIdentityDoesNotReuseHashesAcrossIdentityKinds(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{SessionAffinity: true},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}
+	auth := &cliproxyauth.Auth{ID: "auth-cross-kind"}
+	raw := []byte(`{"model":"gpt-5.6","prompt_cache_key":"shared-id","client_metadata":{"session_id":"shared-id","thread_id":"thread-id"}}`)
+
+	body, state := applyCodexManagedIdentityBody(cfg, auth, nil, "request-id", raw, raw)
+	sessionID := gjson.GetBytes(body, "client_metadata.session_id").String()
+	threadID := gjson.GetBytes(body, "client_metadata.thread_id").String()
+	promptCacheKey := gjson.GetBytes(body, "prompt_cache_key").String()
+	if sessionID == "" || threadID == "" || promptCacheKey == "" {
+		t.Fatalf("managed identities must be non-empty: session=%q thread=%q prompt=%q", sessionID, threadID, promptCacheKey)
+	}
+	if sessionID == "shared-id" || threadID == "thread-id" || promptCacheKey == "shared-id" {
+		t.Fatalf("raw identity leaked: session=%q thread=%q prompt=%q", sessionID, threadID, promptCacheKey)
+	}
+	if promptCacheKey == sessionID {
+		t.Fatalf("explicit prompt cache override reused the session hash: %q", promptCacheKey)
+	}
+	if got, want := promptCacheKey, codexIdentityConfuseUUID(auth.ID, "prompt-cache", "shared-id"); got != want {
+		t.Fatalf("prompt_cache_key = %q, want kind-scoped hash %q", got, want)
+	}
+	if len(state.identityIDs) < 3 {
+		t.Fatalf("identity replacement count = %d, want independent session/thread/prompt mappings", len(state.identityIDs))
 	}
 }
 

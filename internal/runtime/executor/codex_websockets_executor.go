@@ -174,6 +174,9 @@ func (s *codexWebsocketSession) notifyUpstreamDisconnect(err error) {
 }
 
 func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	if opts.Metadata == nil {
+		opts.Metadata = make(map[string]any)
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -236,7 +239,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			e.cfg,
 			auth,
 			codexRequestHeaderSource(ctx, opts.Headers),
-			codexRequestIdentityID(req, opts),
+			codexRequestIdentityID(req, &opts),
 			originalPayloadSource,
 			body,
 		)
@@ -253,10 +256,16 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	executionSessionID := executionSessionIDFromOptions(opts)
 	var sess *codexWebsocketSession
+	sessLockHeld := false
 	if executionSessionID != "" {
 		sess = e.getOrCreateSession(executionSessionID)
 		sess.reqMu.Lock()
-		defer sess.reqMu.Unlock()
+		sessLockHeld = true
+		defer func() {
+			if sessLockHeld {
+				sess.reqMu.Unlock()
+			}
+		}()
 	}
 
 	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)
@@ -275,6 +284,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 	if errDial != nil {
+		if sessLockHeld {
+			sess.reqMu.Unlock()
+			sessLockHeld = false
+		}
 		bodyErr := websocketHandshakeBody(respHS)
 		if respHS != nil {
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
@@ -407,6 +420,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 }
 
 func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	if opts.Metadata == nil {
+		opts.Metadata = make(map[string]any)
+	}
 	log.Debugf("Executing Codex Websockets stream request with auth ID: %s, model: %s", auth.ID, req.Model)
 	if ctx == nil {
 		ctx = context.Background()
@@ -466,7 +482,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			e.cfg,
 			auth,
 			codexRequestHeaderSource(ctx, opts.Headers),
-			codexRequestIdentityID(req, opts),
+			codexRequestIdentityID(req, &opts),
 			userPayload,
 			body,
 		)
