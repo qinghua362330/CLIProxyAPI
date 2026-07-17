@@ -1572,6 +1572,19 @@ func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexI
 				updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "installation_id", confused)
 			}
 		}
+		// turn_started_at_unix_ms comes off the same clock as turn_id — in the capture the
+		// two sit 17 ms apart. Shifting the version-7 ids while leaving this one raw would
+		// put a request's own two timestamps ~40 s apart, which no real client can produce:
+		// they are minted together. Move it by the same account offset so the whole request
+		// reads as one client whose clock runs slightly behind — internally consistent, and
+		// a skewed client clock is unremarkable, unlike a self-contradicting one.
+		if startedAt := gjson.Get(rawTurnMetadata, "turn_started_at_unix_ms"); startedAt.Exists() && startedAt.Type == gjson.Number {
+			shifted := startedAt.Int() - codexIdentityConfuseMillisOffset(state.authID)
+			if shifted < 0 {
+				shifted = 0
+			}
+			updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "turn_started_at_unix_ms", shifted)
+		}
 	}
 	return updatedTurnMetadata
 }

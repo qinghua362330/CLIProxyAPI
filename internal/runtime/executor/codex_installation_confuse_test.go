@@ -271,3 +271,55 @@ func TestIdentityConfuse_NonUUIDOriginalKeepsHashShape(t *testing.T) {
 		t.Fatalf("codexIdentityConfuseUUIDLike = %q, want the plain hash %q", got, want)
 	}
 }
+
+// turn_id and turn_started_at_unix_ms are minted together off one clock: the capture has
+// them 17 ms apart. Shifting the v7 ids while leaving the plaintext sibling raw would put
+// a request's own two timestamps ~40 s apart — a self-contradiction no real client can
+// produce, and a sharper tell than the version nibble this shaping removes.
+func TestIdentityConfuse_TurnStartedAtTracksTurnID(t *testing.T) {
+	realTurnMillis := uuidMillisOf(t, realInboundTurnID)
+	realStartedAt := gjson.Get(realTurnMetadata, "turn_started_at_unix_ms").Int()
+	realDelta := realStartedAt - realTurnMillis
+	if realDelta < 0 || realDelta > 1000 {
+		t.Fatalf("fixture drift: captured turn_started_at is %d ms from turn_id, expected them minted together", realDelta)
+	}
+
+	for _, account := range []string{"pool-account-42", "pool-account-77"} {
+		turnMetadata, _, _ := outboundForAuth(t, account)
+		turnMillis := uuidMillisOf(t, gjson.Get(turnMetadata, "turn_id").String())
+		startedAt := gjson.Get(turnMetadata, "turn_started_at_unix_ms").Int()
+
+		if got := startedAt - turnMillis; got != realDelta {
+			t.Errorf("%s: turn_started_at is %d ms from turn_id, want the captured %d ms", account, got, realDelta)
+		}
+		if startedAt >= realStartedAt {
+			t.Errorf("%s: turn_started_at %d was not shifted (raw %d)", account, startedAt, realStartedAt)
+		}
+	}
+}
+
+// The shift is one virtual clock per account: every timestamp the request carries moves by
+// the same amount, or the request contradicts itself.
+func TestIdentityConfuse_OneClockShiftPerAccount(t *testing.T) {
+	realSession := uuidMillisOf(t, realInboundSessionID)
+	realTurn := uuidMillisOf(t, realInboundTurnID)
+	realStartedAt := gjson.Get(realTurnMetadata, "turn_started_at_unix_ms").Int()
+
+	for _, account := range []string{"pool-account-42", "pool-account-77"} {
+		turnMetadata, sessionID, _ := outboundForAuth(t, account)
+		shifts := map[string]int64{
+			"session-id":              realSession - uuidMillisOf(t, sessionID),
+			"turn_id":                 realTurn - uuidMillisOf(t, gjson.Get(turnMetadata, "turn_id").String()),
+			"turn_started_at_unix_ms": realStartedAt - gjson.Get(turnMetadata, "turn_started_at_unix_ms").Int(),
+		}
+		want := shifts["session-id"]
+		if want <= 0 {
+			t.Fatalf("%s: session was not shifted backwards (%d ms)", account, want)
+		}
+		for name, got := range shifts {
+			if got != want {
+				t.Errorf("%s: %s shifted %d ms, want the account's single offset %d ms", account, name, got, want)
+			}
+		}
+	}
+}
