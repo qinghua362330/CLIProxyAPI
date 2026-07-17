@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/fpobserve"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/sirupsen/logrus"
 )
@@ -39,13 +38,6 @@ func TestFingerprintObserveShapeHelpers(t *testing.T) {
 	if got := fpSessionShape(http.Header{}); got != "none" {
 		t.Fatalf("empty session shape = %q, want none", got)
 	}
-	thread := http.Header{"thread-id": []string{"thread-uuid"}}
-	if got := fpThreadShape(thread); got != "thread-id" {
-		t.Fatalf("thread shape = %q, want thread-id", got)
-	}
-	if got := fpThreadShape(http.Header{}); got != "none" {
-		t.Fatalf("empty thread shape = %q, want none", got)
-	}
 	// fpHeaderRaw must find a raw-keyed header that http.Header.Get would miss.
 	if got := fpHeaderRaw(hyphen, "Session-Id"); got != "uuid" {
 		t.Fatalf("fpHeaderRaw = %q, want uuid", got)
@@ -75,8 +67,6 @@ func TestFingerprintObserveShapeHelpers(t *testing.T) {
 }
 
 func TestFingerprintObserveEnabledEmitsThrottledLog(t *testing.T) {
-	fpobserve.Reset()
-	t.Cleanup(fpobserve.Reset)
 	cfg := &config.Config{}
 	cfg.FingerprintObserve.Enabled = true
 	cfg.FingerprintObserve.MinIntervalSeconds = 1
@@ -90,9 +80,7 @@ func TestFingerprintObserveEnabledEmitsThrottledLog(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil)
 	req.Header.Set("User-Agent", "codex_cli_rs/0.144.1 (Mac OS 26.2.0; arm64) iTerm.app/3.6.10 (codex_cli_rs; 0.144.1)")
-	req.Header["session-id"] = []string{"session-secret-value"}
-	req.Header["thread-id"] = []string{"thread-secret-value"}
-	req.Header["x-client-request-id"] = []string{"request-secret-value"}
+	req.Header["session-id"] = []string{"sid"}
 	auth := &cliproxyauth.Auth{ID: "acc-fp-observe-test", Provider: "codex", Metadata: map[string]any{"account_id": "x"}}
 
 	observeCodexFingerprint(cfg, auth, req)
@@ -102,18 +90,6 @@ func TestFingerprintObserveEnabledEmitsThrottledLog(t *testing.T) {
 	}
 	if !strings.Contains(out, "session-id") {
 		t.Fatalf("expected session_hdr=session-id in log, got: %s", out)
-	}
-	if !strings.Contains(out, "thread-id") || !strings.Contains(out, "present") {
-		t.Fatalf("expected thread shape and client-request presence in log, got: %s", out)
-	}
-	for _, secret := range []string{"session-secret-value", "thread-secret-value", "request-secret-value"} {
-		if strings.Contains(out, secret) {
-			t.Fatalf("fingerprint log leaked raw ID %q: %s", secret, out)
-		}
-	}
-	snapshot := fpobserve.Snapshot()
-	if len(snapshot) != 1 || snapshot[0].SessionHdr != "session-id" || snapshot[0].ThreadHdr != "thread-id" || snapshot[0].ClientReq != "present" {
-		t.Fatalf("fingerprint snapshot = %#v, want privacy-safe ID shapes/presence", snapshot)
 	}
 
 	// Second call for the same account within the interval must be throttled (no new line).

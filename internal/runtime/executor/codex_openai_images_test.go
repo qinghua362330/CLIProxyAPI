@@ -46,8 +46,6 @@ func TestCodexExecutorDirectOpenAIImageGenerationUsesImagesEndpoint(t *testing.T
 	var gotVersion string
 	var gotTurnMetadata string
 	var gotClientRequestID string
-	var gotSessionID string
-	var gotThreadID string
 	var gotOriginator string
 	var gotBody []byte
 	upstreamBody := []byte(`{"created":1713833628,"data":[{"b64_json":"AA=="}],"usage":{"total_tokens":100,"input_tokens":50,"output_tokens":50}}`)
@@ -59,8 +57,6 @@ func TestCodexExecutorDirectOpenAIImageGenerationUsesImagesEndpoint(t *testing.T
 		gotVersion = r.Header.Get("Version")
 		gotTurnMetadata = r.Header.Get("X-Codex-Turn-Metadata")
 		gotClientRequestID = r.Header.Get("X-Client-Request-Id")
-		gotSessionID = r.Header.Get("Session-Id")
-		gotThreadID = r.Header.Get("Thread-Id")
 		gotOriginator = r.Header.Get("Originator")
 		var errRead error
 		gotBody, errRead = io.ReadAll(r.Body)
@@ -80,20 +76,10 @@ func TestCodexExecutorDirectOpenAIImageGenerationUsesImagesEndpoint(t *testing.T
 		"Originator":            "Codex Desktop",
 	})
 	executor := NewCodexExecutor(&config.Config{})
-	opts := codexOpenAIImageTestOptions(codexImagesGenerationsPath, false)
-	opts.Headers = http.Header{
-		"Session-Id":            []string{"image-session"},
-		"Thread-Id":             []string{"image-thread"},
-		"X-Client-Request-Id":   []string{"client-request-1"},
-		"User-Agent":            []string{"downstream-client/9.9"},
-		"Version":               []string{"0.135.0"},
-		"X-Codex-Turn-Metadata": []string{`{"turn_id":"turn-1"}`},
-		"Originator":            []string{"Codex Desktop"},
-	}
 	resp, errExecute := executor.Execute(ctx, newCodexOpenAIImageTestAuth(server.URL), cliproxyexecutor.Request{
 		Model:   "codex/gpt-image-1.5",
 		Payload: []byte(`{"model":"codex/gpt-image-1.5","prompt":"A cute baby sea otter","n":1,"size":"1024x1024","quality":"high","background":"opaque","output_format":"jpeg","output_compression":70,"moderation":"low","extra":{"preserve":true},"stream":false}`),
-	}, opts)
+	}, codexOpenAIImageTestOptions(codexImagesGenerationsPath, false))
 	if errExecute != nil {
 		t.Fatalf("Execute() error = %v", errExecute)
 	}
@@ -107,8 +93,8 @@ func TestCodexExecutorDirectOpenAIImageGenerationUsesImagesEndpoint(t *testing.T
 	if gotAccept != "application/json" {
 		t.Fatalf("Accept = %q, want application/json", gotAccept)
 	}
-	if gotUA != "downstream-client/9.9" {
-		t.Fatalf("User-Agent = %q, want downstream identity", gotUA)
+	if gotUA != codexUserAgent {
+		t.Fatalf("User-Agent = %q, want codex default %q", gotUA, codexUserAgent)
 	}
 	if gotVersion != "0.135.0" {
 		t.Fatalf("Version = %q, want %q", gotVersion, "0.135.0")
@@ -118,9 +104,6 @@ func TestCodexExecutorDirectOpenAIImageGenerationUsesImagesEndpoint(t *testing.T
 	}
 	if gotClientRequestID != "client-request-1" {
 		t.Fatalf("X-Client-Request-Id = %q, want %q", gotClientRequestID, "client-request-1")
-	}
-	if gotSessionID != "image-session" || gotThreadID != "image-thread" {
-		t.Fatalf("image IDs = session %q thread %q, want distinct image-session/image-thread", gotSessionID, gotThreadID)
 	}
 	if gotOriginator != "Codex Desktop" {
 		t.Fatalf("Originator = %q, want %q", gotOriginator, "Codex Desktop")
@@ -142,152 +125,13 @@ func TestCodexExecutorDirectOpenAIImageGenerationUsesImagesEndpoint(t *testing.T
 	}
 }
 
-func TestCodexExecutorDirectOpenAIImageCustomOAuthPreservesRawIdentity(t *testing.T) {
-	var gotUA string
-	var gotOriginator string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotUA = r.Header.Get("User-Agent")
-		gotOriginator = r.Header.Get("Originator")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"created":1713833628,"data":[{"b64_json":"AA=="}]}`))
-	}))
-	defer server.Close()
-
-	auth := &cliproxyauth.Auth{
-		Provider: "codex",
-		Attributes: map[string]string{
-			"base_url": server.URL,
-		},
-		Metadata: map[string]any{"access_token": "oauth-token"},
-	}
-	opts := codexOpenAIImageTestOptions(codexImagesGenerationsPath, false)
-	opts.Headers = http.Header{
-		"User-Agent": []string{"custom-client/7.4"},
-		"Originator": []string{"custom-origin"},
-	}
-	_, err := NewCodexExecutor(&config.Config{}).Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "gpt-image-1.5",
-		Payload: []byte(`{"model":"gpt-image-1.5","prompt":"identity test"}`),
-	}, opts)
-	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-	if gotUA != "custom-client/7.4" || gotOriginator != "custom-origin" {
-		t.Fatalf("custom identity = UA %q Originator %q, want raw values", gotUA, gotOriginator)
-	}
-}
-
-func TestCodexExecutorDirectOpenAIImageOfficialOAuthOmitsResponsesIdentityOnWire(t *testing.T) {
-	tests := []struct {
-		name           string
-		userAgent      string
-		wantUserAgent  string
-		wantOriginator string
-	}{
-		{
-			name:           "recognized leading product",
-			userAgent:      "CoDeX_ClI_Rs/0.144.5 (darwin; arm64)",
-			wantUserAgent:  "codex_cli_rs/0.144.5 (darwin; arm64)",
-			wantOriginator: "codex_cli_rs",
-		},
-		{
-			name:           "recognized final trailer repairs prefix",
-			userAgent:      "proxy-client/1.2 (codex_vscode; 0.144.5)",
-			wantUserAgent:  "codex_vscode/1.2 (codex_vscode; 0.144.5)",
-			wantOriginator: "codex_vscode",
-		},
-		{
-			name:           "invalid identity falls back as one pair",
-			userAgent:      "proxy-client/1.2",
-			wantUserAgent:  codexUserAgent,
-			wantOriginator: codexOriginator,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			captured := make(chan http.Header, 1)
-			ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", codexImageRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
-				captured <- r.Header.Clone()
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"created":1713833628,"data":[{"b64_json":"AA=="}]}`)),
-					Request:    r,
-				}, nil
-			}))
-			auth := &cliproxyauth.Auth{
-				Provider: "codex",
-				Metadata: map[string]any{"access_token": "oauth-token"},
-			}
-			opts := codexOpenAIImageTestOptions(codexImagesGenerationsPath, false)
-			opts.Headers = http.Header{
-				"User-Agent":               []string{tc.userAgent},
-				"Originator":               []string{"must-be-replaced"},
-				"session-id":               []string{"must-not-leak-session"},
-				"thread-id":                []string{"must-not-leak-thread"},
-				"x-client-request-id":      []string{"must-not-leak-client"},
-				"X-Codex-Installation-Id":  []string{"must-not-leak-installation"},
-				"X-Codex-Window-Id":        []string{"must-not-leak-thread:3"},
-				"X-Codex-Parent-Thread-Id": []string{"must-not-leak-parent"},
-				"X-Codex-Turn-Metadata":    []string{`{"thread_id":"must-not-leak-thread"}`},
-				"X-Codex-Turn-State":       []string{"must-not-leak-state"},
-			}
-			_, err := NewCodexExecutor(&config.Config{}).Execute(ctx, auth, cliproxyexecutor.Request{
-				Model:   "gpt-image-1.5",
-				Payload: []byte(`{"model":"gpt-image-1.5","prompt":"identity test"}`),
-			}, opts)
-			if err != nil {
-				t.Fatalf("Execute() error = %v", err)
-			}
-			headers := <-captured
-			if got := headers.Get("User-Agent"); got != tc.wantUserAgent {
-				t.Fatalf("wire User-Agent = %q, want %q", got, tc.wantUserAgent)
-			}
-			if got := headers.Get("Originator"); got != tc.wantOriginator {
-				t.Fatalf("wire Originator = %q, want %q", got, tc.wantOriginator)
-			}
-			if got := codexSessionHeaderValue(headers); got != "" {
-				t.Fatalf("wire session-id = %q, want absent for standalone Images API", got)
-			}
-			if got := codexThreadHeaderValue(headers); got != "" {
-				t.Fatalf("wire thread-id = %q, want absent for standalone Images API", got)
-			}
-			if got := codexClientRequestIDValue(headers); got != "" {
-				t.Fatalf("wire X-Client-Request-Id = %q, want absent for standalone Images API", got)
-			}
-			for _, key := range []string{
-				"X-Codex-Installation-Id",
-				"X-Codex-Window-Id",
-				"X-Codex-Parent-Thread-Id",
-				"X-Codex-Turn-Metadata",
-				"X-Codex-Turn-State",
-			} {
-				if got := headerValueCaseInsensitive(headers, key); got != "" {
-					t.Fatalf("wire %s = %q, want absent for standalone Images API", key, got)
-				}
-			}
-		})
-	}
-}
-
-type codexImageRoundTripperFunc func(*http.Request) (*http.Response, error)
-
-func (f codexImageRoundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
-	return f(r)
-}
-
 func TestCodexExecutorDirectOpenAIImageGenerationStreamsImagesEndpoint(t *testing.T) {
 	var gotPath string
 	var gotAccept string
-	var gotUA string
-	var gotOriginator string
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotAccept = r.Header.Get("Accept")
-		gotUA = r.Header.Get("User-Agent")
-		gotOriginator = r.Header.Get("Originator")
 		var errRead error
 		gotBody, errRead = io.ReadAll(r.Body)
 		if errRead != nil {
@@ -300,15 +144,10 @@ func TestCodexExecutorDirectOpenAIImageGenerationStreamsImagesEndpoint(t *testin
 	defer server.Close()
 
 	executor := NewCodexExecutor(&config.Config{})
-	opts := codexOpenAIImageTestOptions(codexImagesGenerationsPath, true)
-	opts.Headers = http.Header{
-		"User-Agent": []string{"stream-client/4.2"},
-		"Originator": []string{"stream-origin"},
-	}
 	stream, errStream := executor.ExecuteStream(context.Background(), newCodexOpenAIImageTestAuth(server.URL), cliproxyexecutor.Request{
 		Model:   "gpt-image-2",
 		Payload: []byte(`{"model":"gpt-image-2","prompt":"A cute baby sea otter","partial_images":2}`),
-	}, opts)
+	}, codexOpenAIImageTestOptions(codexImagesGenerationsPath, true))
 	if errStream != nil {
 		t.Fatalf("ExecuteStream() error = %v", errStream)
 	}
@@ -326,9 +165,6 @@ func TestCodexExecutorDirectOpenAIImageGenerationStreamsImagesEndpoint(t *testin
 	}
 	if gotAccept != "text/event-stream" {
 		t.Fatalf("Accept = %q, want text/event-stream", gotAccept)
-	}
-	if gotUA != "stream-client/4.2" || gotOriginator != "stream-origin" {
-		t.Fatalf("stream identity = UA %q Originator %q, want raw values", gotUA, gotOriginator)
 	}
 	if !gjson.GetBytes(gotBody, "stream").Bool() {
 		t.Fatalf("stream flag missing from upstream body: %s", string(gotBody))

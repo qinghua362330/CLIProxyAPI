@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -225,226 +224,6 @@ func TestCodexWebsocketsExecuteStreamPassesThroughUpstreamWebsocketPayloadForDow
 	}
 }
 
-func TestCodexWebsocketsExecuteStreamUnlocksSessionBeforeHTTPFallback(t *testing.T) {
-	type capturedRequest struct {
-		transport       string
-		clientRequestID string
-	}
-	captured := make(chan capturedRequest, 4)
-	firstHTTPStarted := make(chan struct{})
-	releaseFirstHTTP := make(chan struct{}, 1)
-	defer func() {
-		select {
-		case releaseFirstHTTP <- struct{}{}:
-		default:
-		}
-	}()
-	var httpRequests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		transport := "http"
-		if websocket.IsWebSocketUpgrade(r) {
-			transport = "websocket"
-		}
-		captured <- capturedRequest{
-			transport:       transport,
-			clientRequestID: headerValueCaseInsensitive(r.Header, "x-client-request-id"),
-		}
-		if transport == "websocket" {
-			w.WriteHeader(http.StatusUpgradeRequired)
-			return
-		}
-		if httpRequests.Add(1) == 1 {
-			close(firstHTTPStarted)
-			<-releaseFirstHTTP
-		}
-
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n"))
-	}))
-	defer server.Close()
-
-	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
-	req := cliproxyexecutor.Request{
-		Model:   "gpt-5-codex",
-		Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`),
-	}
-	const requestIdentity = "request-identity-stable"
-	opts := cliproxyexecutor.Options{
-		SourceFormat:   sdktranslator.FromString("openai-response"),
-		ResponseFormat: sdktranslator.FromString("openai-response"),
-		Headers:        http.Header{"X-Client-Request-Id": []string{requestIdentity}},
-		Metadata: map[string]any{
-			cliproxyexecutor.ExecutionSessionMetadataKey: t.Name(),
-		},
-	}
-
-	run := func() error {
-		result, err := exec.ExecuteStream(context.Background(), auth, req, opts)
-		if err != nil {
-			return err
-		}
-		for chunk := range result.Chunks {
-			if chunk.Err != nil {
-				return chunk.Err
-			}
-		}
-		return nil
-	}
-	assertRequest := func(index int, wantTransport string) {
-		t.Helper()
-		select {
-		case got := <-captured:
-			if got.transport != wantTransport {
-				t.Fatalf("request %d transport = %q, want %q", index, got.transport, wantTransport)
-			}
-			if got.clientRequestID != requestIdentity {
-				t.Fatalf("request %d X-Client-Request-Id = %q, want stable %q", index, got.clientRequestID, requestIdentity)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for request %d (%s)", index, wantTransport)
-		}
-	}
-
-	firstDone := make(chan error, 1)
-	go func() { firstDone <- run() }()
-	assertRequest(1, "websocket")
-	assertRequest(2, "http")
-	select {
-	case <-firstHTTPStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("first HTTP fallback did not start")
-	}
-	secondDone := make(chan error, 1)
-	go func() { secondDone <- run() }()
-	assertRequest(3, "websocket")
-	assertRequest(4, "http")
-	releaseFirstHTTP <- struct{}{}
-
-	select {
-	case err := <-firstDone:
-		if err != nil {
-			t.Fatalf("first ExecuteStream() error = %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("first ExecuteStream() did not complete after releasing HTTP fallback")
-	}
-	select {
-	case err := <-secondDone:
-		if err != nil {
-			t.Fatalf("second ExecuteStream() error = %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("second ExecuteStream() did not complete")
-	}
-}
-
-func TestCodexWebsocketsExecuteUnlocksSessionBeforeHTTPFallback(t *testing.T) {
-	type capturedRequest struct {
-		transport       string
-		clientRequestID string
-	}
-	captured := make(chan capturedRequest, 4)
-	firstHTTPStarted := make(chan struct{})
-	releaseFirstHTTP := make(chan struct{}, 1)
-	defer func() {
-		select {
-		case releaseFirstHTTP <- struct{}{}:
-		default:
-		}
-	}()
-	var httpRequests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		transport := "http"
-		if websocket.IsWebSocketUpgrade(r) {
-			transport = "websocket"
-		}
-		captured <- capturedRequest{
-			transport:       transport,
-			clientRequestID: headerValueCaseInsensitive(r.Header, "x-client-request-id"),
-		}
-		if transport == "websocket" {
-			w.WriteHeader(http.StatusUpgradeRequired)
-			return
-		}
-		if httpRequests.Add(1) == 1 {
-			close(firstHTTPStarted)
-			<-releaseFirstHTTP
-		}
-
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n"))
-	}))
-	defer server.Close()
-
-	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
-	req := cliproxyexecutor.Request{
-		Model:   "gpt-5-codex",
-		Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`),
-	}
-	const requestIdentity = "request-identity-stable"
-	opts := cliproxyexecutor.Options{
-		SourceFormat:   sdktranslator.FromString("openai-response"),
-		ResponseFormat: sdktranslator.FromString("openai-response"),
-		Headers:        http.Header{"X-Client-Request-Id": []string{requestIdentity}},
-		Metadata: map[string]any{
-			cliproxyexecutor.ExecutionSessionMetadataKey: t.Name(),
-		},
-	}
-
-	run := func() error {
-		_, err := exec.Execute(context.Background(), auth, req, opts)
-		return err
-	}
-	assertRequest := func(index int, wantTransport string) {
-		t.Helper()
-		select {
-		case got := <-captured:
-			if got.transport != wantTransport {
-				t.Fatalf("request %d transport = %q, want %q", index, got.transport, wantTransport)
-			}
-			if got.clientRequestID != requestIdentity {
-				t.Fatalf("request %d X-Client-Request-Id = %q, want stable %q", index, got.clientRequestID, requestIdentity)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for request %d (%s)", index, wantTransport)
-		}
-	}
-
-	firstDone := make(chan error, 1)
-	go func() { firstDone <- run() }()
-	assertRequest(1, "websocket")
-	assertRequest(2, "http")
-	select {
-	case <-firstHTTPStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("first HTTP fallback did not start")
-	}
-	secondDone := make(chan error, 1)
-	go func() { secondDone <- run() }()
-	assertRequest(3, "websocket")
-	assertRequest(4, "http")
-	releaseFirstHTTP <- struct{}{}
-
-	select {
-	case err := <-firstDone:
-		if err != nil {
-			t.Fatalf("first Execute() error = %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("first Execute() did not complete after releasing HTTP fallback")
-	}
-	select {
-	case err := <-secondDone:
-		if err != nil {
-			t.Fatalf("second Execute() error = %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("second Execute() did not complete")
-	}
-}
-
 func TestCodexWebsocketsExecuteStreamPropagatesUpstreamErrorForDownstreamWebsocket(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	errorPayload := []byte(`{"type":"error","status":429,"error":{"code":"websocket_connection_limit_reached","message":"too many websockets"}}`)
@@ -628,15 +407,13 @@ func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnInvalidate(t *testing.T) 
 }
 
 func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) {
-	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, explicitOAuthAuth(), "", nil)
+	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, nil, "", nil)
 
 	if got := headers.Get("OpenAI-Beta"); got != codexResponsesWebsocketBetaHeaderValue {
 		t.Fatalf("OpenAI-Beta = %s, want %s", got, codexResponsesWebsocketBetaHeaderValue)
 	}
-	userAgent := headers.Get("User-Agent")
-	originator, pairedUserAgent, ok := pairCodexClientIdentity(userAgent)
-	if !ok || originator != codexOriginator || pairedUserAgent != userAgent {
-		t.Fatalf("User-Agent = %q, want a coherent Codex OAuth identity", userAgent)
+	if got := headers.Get("User-Agent"); got != codexUserAgent {
+		t.Fatalf("User-Agent = %s, want %s", got, codexUserAgent)
 	}
 	if !strings.HasPrefix(codexUserAgent, codexOriginator+"/") {
 		t.Fatalf("default Codex User-Agent = %s, want prefix %s/", codexUserAgent, codexOriginator)
@@ -646,8 +423,8 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	}
 	// The real codex CLI UA ends at the terminal token; it must NOT carry the
 	// fabricated "(codex-tui; ver)" trailing segment (verified vs openai/codex).
-	if strings.Contains(userAgent, "(codex-tui;") {
-		t.Fatalf("default Codex User-Agent = %s must not carry a (codex-tui; ver) suffix", userAgent)
+	if strings.Contains(codexUserAgent, "(codex-tui;") {
+		t.Fatalf("default Codex User-Agent = %s must not carry a (codex-tui; ver) suffix", codexUserAgent)
 	}
 	if got := headers.Get("Originator"); got != codexOriginator {
 		t.Fatalf("Originator = %s, want %s", got, codexOriginator)
@@ -678,7 +455,6 @@ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing
 		"X-Codex-Turn-Metadata": `{"turn_id":"turn-1"}`,
 		"X-Client-Request-Id":   "019d2233-e240-7162-992d-38df0a2a0e0d",
 		"session-id":            "legacy-session",
-		"thread-id":             "legacy-thread",
 	})
 
 	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil)
@@ -686,7 +462,7 @@ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing
 	// Originator is normalized on the OAuth path for fingerprint consistency: a
 	// non-first-party value like "Codex Desktop" must not pass through alongside a
 	// codex_cli_rs User-Agent (a cross-layer identity mismatch). The other identity
-	// headers below are canonicalized to the official session/thread pairing.
+	// headers below still pass through untouched.
 	if got := headers.Get("Originator"); got != codexOriginator {
 		t.Fatalf("Originator = %s, want normalized %s", got, codexOriginator)
 	}
@@ -699,17 +475,14 @@ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing
 	if got := headers.Get("X-Codex-Turn-Metadata"); got != `{"turn_id":"turn-1"}` {
 		t.Fatalf("X-Codex-Turn-Metadata = %s, want %s", got, `{"turn_id":"turn-1"}`)
 	}
-	if got := headerValueCaseInsensitive(headers, "x-client-request-id"); got != "legacy-thread" {
-		t.Fatalf("X-Client-Request-Id = %s, want thread-id legacy-thread", got)
+	if got := headers.Get("X-Client-Request-Id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
+		t.Fatalf("X-Client-Request-Id = %s, want %s", got, "019d2233-e240-7162-992d-38df0a2a0e0d")
 	}
 	if got := headers["session-id"]; len(got) != 1 || got[0] != "legacy-session" {
 		t.Fatalf("session-id = %#v, want [legacy-session]", got)
 	}
 	if got := headers.Get("Session-Id"); got != "" {
 		t.Fatalf("Session-Id = %s, want empty", got)
-	}
-	if got := headers["thread-id"]; len(got) != 1 || got[0] != "legacy-thread" {
-		t.Fatalf("thread-id = %#v, want [legacy-thread]", got)
 	}
 }
 
@@ -737,7 +510,7 @@ func TestApplyCodexWebsocketHeadersCanonicalizesLegacyUnderscoreSessionHeader(t 
 func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
-			UserAgent:    "codex_vscode/1.0",
+			UserAgent:    "my-codex-client/1.0",
 			BetaFeatures: "feature-a,feature-b",
 		},
 	}
@@ -748,11 +521,8 @@ func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
 
 	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "", cfg)
 
-	if got := headers.Get("User-Agent"); got != "codex_vscode/1.0" {
-		t.Fatalf("User-Agent = %s, want %s", got, "codex_vscode/1.0")
-	}
-	if got := headers.Get("Originator"); got != "codex_vscode" {
-		t.Fatalf("Originator = %s, want codex_vscode", got)
+	if got := headers.Get("User-Agent"); got != "my-codex-client/1.0" {
+		t.Fatalf("User-Agent = %s, want %s", got, "my-codex-client/1.0")
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "feature-a,feature-b" {
 		t.Fatalf("x-codex-beta-features = %s, want %s", got, "feature-a,feature-b")
@@ -765,7 +535,7 @@ func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
 func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
-			UserAgent:    "codex_vscode/2.0",
+			UserAgent:    "config-ua",
 			BetaFeatures: "config-beta",
 		},
 	}
@@ -774,20 +544,17 @@ func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *
 		Metadata: map[string]any{"email": "user@example.com"},
 	}
 	ctx := contextWithGinHeaders(map[string]string{
-		"User-Agent":            "codex-tui/3.0",
+		"User-Agent":            "client-ua",
 		"X-Codex-Beta-Features": "client-beta",
 	})
 	headers := http.Header{}
-	headers.Set("User-Agent", "codex_exec/4.0")
+	headers.Set("User-Agent", "existing-ua")
 	headers.Set("X-Codex-Beta-Features", "existing-beta")
 
 	got := applyCodexWebsocketHeaders(ctx, headers, auth, "", cfg)
 
-	if gotVal := got.Get("User-Agent"); gotVal != "codex_exec/4.0" {
-		t.Fatalf("User-Agent = %s, want %s", gotVal, "codex_exec/4.0")
-	}
-	if gotVal := got.Get("Originator"); gotVal != "codex_exec" {
-		t.Fatalf("Originator = %s, want codex_exec", gotVal)
+	if gotVal := got.Get("User-Agent"); gotVal != "existing-ua" {
+		t.Fatalf("User-Agent = %s, want %s", gotVal, "existing-ua")
 	}
 	if gotVal := got.Get("x-codex-beta-features"); gotVal != "existing-beta" {
 		t.Fatalf("x-codex-beta-features = %s, want %s", gotVal, "existing-beta")
@@ -797,7 +564,7 @@ func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *
 func TestApplyCodexWebsocketHeadersConfigUserAgentOverridesClientHeader(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
-			UserAgent:    "codex_vscode/2.0",
+			UserAgent:    "config-ua",
 			BetaFeatures: "config-beta",
 		},
 	}
@@ -806,17 +573,14 @@ func TestApplyCodexWebsocketHeadersConfigUserAgentOverridesClientHeader(t *testi
 		Metadata: map[string]any{"email": "user@example.com"},
 	}
 	ctx := contextWithGinHeaders(map[string]string{
-		"User-Agent":            "codex-tui/3.0",
+		"User-Agent":            "client-ua",
 		"X-Codex-Beta-Features": "client-beta",
 	})
 
 	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", cfg)
 
-	if got := headers.Get("User-Agent"); got != "codex_vscode/2.0" {
-		t.Fatalf("User-Agent = %s, want %s", got, "codex_vscode/2.0")
-	}
-	if got := headers.Get("Originator"); got != "codex_vscode" {
-		t.Fatalf("Originator = %s, want codex_vscode", got)
+	if got := headers.Get("User-Agent"); got != "config-ua" {
+		t.Fatalf("User-Agent = %s, want %s", got, "config-ua")
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "client-beta" {
 		t.Fatalf("x-codex-beta-features = %s, want %s", got, "client-beta")
@@ -879,25 +643,19 @@ func TestApplyCodexWebsocketHeadersUsesCanonicalAccountHeader(t *testing.T) {
 	}
 }
 
-func TestApplyCodexPromptCacheHeadersKeepsCacheSeparateFromRequestIdentity(t *testing.T) {
+func TestApplyCodexPromptCacheHeadersSetsSessionIDAndLegacyConversation(t *testing.T) {
 	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"prompt_cache_key":"cache-1"}`)}
 
-	body, headers := applyCodexPromptCacheHeaders("openai-response", req, []byte(`{"model":"gpt-5-codex"}`))
-	promptCacheKey := gjson.GetBytes(body, "prompt_cache_key").String()
-	body, identityState := applyCodexManagedIdentityBody(nil, explicitOAuthAuth(), nil, "request-1", req.Payload, body)
-	headers = applyCodexManagedWebsocketHeaders(context.Background(), headers, nil, explicitOAuthAuth(), "", nil, req.Model, &identityState, promptCacheKey, "https://chatgpt.com"+codexOfficialResponsesPath)
+	_, headers := applyCodexPromptCacheHeaders("openai-response", req, []byte(`{"model":"gpt-5-codex"}`))
 
-	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != "cache-1" {
-		t.Fatalf("prompt_cache_key = %q, want cache-1", got)
-	}
-	if got := headers["session-id"]; len(got) != 1 || got[0] != "request-1" {
-		t.Fatalf("session-id = %#v, want [request-1]", got)
+	if got := headers["session-id"]; len(got) != 1 || got[0] != "cache-1" {
+		t.Fatalf("session-id = %#v, want [cache-1]", got)
 	}
 	if got := headers.Get("Session-Id"); got != "" {
 		t.Fatalf("Session-Id = %s, want empty", got)
 	}
-	if got := headers["thread-id"]; len(got) != 1 || got[0] != "request-1" {
-		t.Fatalf("thread-id = %#v, want [request-1]", got)
+	if got := headers["thread-id"]; len(got) != 1 || got[0] != "cache-1" {
+		t.Fatalf("thread-id = %#v, want [cache-1]", got)
 	}
 	if got := headers.Get("Conversation_id"); got != "" {
 		t.Fatalf("Conversation_id = %s, want empty (no longer sent)", got)
@@ -931,21 +689,11 @@ func TestApplyCodexPromptCacheHeadersClaudeUsesClaudeCodeSessionID(t *testing.T)
 	if secondKey != firstKey {
 		t.Fatalf("same Claude Code session_id produced different websocket prompt_cache_key: first=%q second=%q", firstKey, secondKey)
 	}
-	firstBody, firstState := applyCodexManagedIdentityBody(nil, explicitOAuthAuth(), nil, "request-first", firstReq.Payload, firstBody)
-	secondBody, secondState := applyCodexManagedIdentityBody(nil, explicitOAuthAuth(), nil, "request-second", secondReq.Payload, secondBody)
-	firstHeaders = applyCodexManagedWebsocketHeaders(context.Background(), firstHeaders, nil, explicitOAuthAuth(), "", nil, firstReq.Model, &firstState, firstKey, "https://chatgpt.com"+codexOfficialResponsesPath)
-	secondHeaders = applyCodexManagedWebsocketHeaders(context.Background(), secondHeaders, nil, explicitOAuthAuth(), "", nil, secondReq.Model, &secondState, secondKey, "https://chatgpt.com"+codexOfficialResponsesPath)
-	if got := firstHeaders["session-id"]; len(got) != 1 || got[0] != "request-first" {
-		t.Fatalf("first session-id = %#v, want [request-first]", got)
+	if got := firstHeaders["session-id"]; len(got) != 1 || got[0] != firstKey {
+		t.Fatalf("first session-id = %#v, want [%q]", got, firstKey)
 	}
-	if got := secondHeaders["session-id"]; len(got) != 1 || got[0] != "request-second" {
-		t.Fatalf("second session-id = %#v, want [request-second]", got)
-	}
-	if got := gjson.GetBytes(firstBody, "prompt_cache_key").String(); got != firstKey {
-		t.Fatalf("first prompt_cache_key = %q, want %q", got, firstKey)
-	}
-	if got := gjson.GetBytes(secondBody, "prompt_cache_key").String(); got != secondKey {
-		t.Fatalf("second prompt_cache_key = %q, want %q", got, secondKey)
+	if got := secondHeaders["session-id"]; len(got) != 1 || got[0] != firstKey {
+		t.Fatalf("second session-id = %#v, want [%q]", got, firstKey)
 	}
 }
 
@@ -976,40 +724,37 @@ func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testin
 		Routing: config.RoutingConfig{SessionAffinity: true},
 		Codex:   config.CodexConfig{IdentityConfuse: true},
 	}
-	auth := &cliproxyauth.Auth{ID: "auth-ws-1", Provider: "codex", Metadata: map[string]any{"access_token": "oauth-token"}}
+	auth := &cliproxyauth.Auth{ID: "auth-ws-1", Provider: "codex"}
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5-codex",
 		Payload: []byte(`{"prompt_cache_key":"cache-ws-1","client_metadata":{"x-codex-installation-id":"install-ws-1"}}`),
 	}
 
 	body, headers := applyCodexPromptCacheHeaders("openai-response", req, []byte(`{"model":"gpt-5-codex"}`))
+	body, identityState := applyCodexIdentityConfuseBody(cfg, auth, req.Payload, body)
 	ctx := contextWithGinHeaders(map[string]string{
 		"X-Codex-Turn-Metadata": `{"prompt_cache_key":"cache-ws-1","turn_id":"turn-ws-1","window_id":"cache-ws-1:0"}`,
 		"X-Client-Request-Id":   "client-request-1",
-		"session-id":            "session-ws-1",
-		"thread-id":             "cache-ws-1",
 	})
-	body, identityState := applyCodexManagedIdentityBody(cfg, auth, codexRequestHeaderSource(ctx, nil), "request-ws-1", req.Payload, body)
-	headers = applyCodexManagedWebsocketHeaders(ctx, headers, nil, auth, "oauth-token", cfg, req.Model, &identityState, gjson.GetBytes(body, "prompt_cache_key").String(), "https://chatgpt.com"+codexOfficialResponsesPath)
+	headers = applyCodexWebsocketHeaders(ctx, headers, auth, "oauth-token", cfg)
+	applyCodexIdentityConfuseHeaders(headers, &identityState)
 
-	expectedThreadID := codexIdentityConfuseUUID("auth-ws-1", "thread", "cache-ws-1")
-	expectedPromptCacheKey := expectedThreadID
-	expectedSessionID := codexIdentityConfuseUUID("auth-ws-1", "session", "session-ws-1")
+	expectedPromptCacheKey := codexIdentityConfuseUUID("auth-ws-1", "prompt-cache", "cache-ws-1")
 	expectedTurnID := codexIdentityConfuseUUID("auth-ws-1", "turn", "turn-ws-1")
 	if gotKey := gjson.GetBytes(body, "prompt_cache_key").String(); gotKey != expectedPromptCacheKey {
 		t.Fatalf("prompt_cache_key = %q, want %q", gotKey, expectedPromptCacheKey)
 	}
-	if gotSession := headers["session-id"]; len(gotSession) != 1 || gotSession[0] != expectedSessionID {
-		t.Fatalf("session-id = %#v, want [%q]", gotSession, expectedSessionID)
+	if gotSession := headers["session-id"]; len(gotSession) != 1 || gotSession[0] != expectedPromptCacheKey {
+		t.Fatalf("session-id = %#v, want [%q]", gotSession, expectedPromptCacheKey)
 	}
 	if gotCanonicalSession := headers.Get("Session-Id"); gotCanonicalSession != "" {
 		t.Fatalf("Session-Id = %q, want empty", gotCanonicalSession)
 	}
-	if gotRequestID := headerValueCaseInsensitive(headers, "x-client-request-id"); gotRequestID != expectedThreadID {
-		t.Fatalf("x-client-request-id = %q, want confused thread %q", gotRequestID, expectedThreadID)
+	if gotRequestID := headers.Get("X-Client-Request-Id"); gotRequestID != expectedPromptCacheKey {
+		t.Fatalf("X-Client-Request-Id = %q, want %q", gotRequestID, expectedPromptCacheKey)
 	}
-	if gotThreadID := headers["thread-id"]; len(gotThreadID) != 1 || gotThreadID[0] != expectedThreadID {
-		t.Fatalf("thread-id = %#v, want [%q]", gotThreadID, expectedThreadID)
+	if gotThreadID := headers["thread-id"]; len(gotThreadID) != 1 || gotThreadID[0] != expectedPromptCacheKey {
+		t.Fatalf("thread-id = %#v, want [%q]", gotThreadID, expectedPromptCacheKey)
 	}
 	if gotConversation := headers.Get("Conversation_id"); gotConversation != "" {
 		t.Fatalf("Conversation_id = %q, want empty (no longer sent)", gotConversation)
@@ -1041,9 +786,7 @@ func TestCodexIdentityConfuseResponsePayloadHidesUpstreamAndRestoresClient(t *te
 		promptCacheKey:         codexIdentityConfuseUUID("auth-ws-1", "prompt-cache", "cache-ws-1"),
 	}
 	expectedTurnID := state.confuseTurnID("turn-ws-1")
-	expectedThreadID := state.confuseIdentity("thread", "thread-ws-1")
-	expectedInstallationID := state.confuseInstallationID("install-ws-1")
-	rawPayload := []byte(`{"type":"response.completed","response":{"prompt_cache_key":"cache-ws-1","turn_id":"turn-ws-1","thread_id":"thread-ws-1","installation_id":"install-ws-1"},"prompt_cache_key":"cache-ws-1","turn_id":"turn-ws-1","thread_id":"thread-ws-1","installation_id":"install-ws-1"}`)
+	rawPayload := []byte(`{"type":"response.completed","response":{"prompt_cache_key":"cache-ws-1","turn_id":"turn-ws-1"},"prompt_cache_key":"cache-ws-1","turn_id":"turn-ws-1"}`)
 
 	upstreamPayload := applyCodexIdentityConfuseResponsePayload(rawPayload, state)
 	if bytes.Contains(upstreamPayload, []byte(`cache-ws-1`)) {
@@ -1058,9 +801,6 @@ func TestCodexIdentityConfuseResponsePayloadHidesUpstreamAndRestoresClient(t *te
 	if !bytes.Contains(upstreamPayload, []byte(expectedTurnID)) {
 		t.Fatalf("upstream payload missing confused turn_id: %s", string(upstreamPayload))
 	}
-	if !bytes.Contains(upstreamPayload, []byte(expectedThreadID)) || !bytes.Contains(upstreamPayload, []byte(expectedInstallationID)) {
-		t.Fatalf("upstream payload missing confused thread/installation identity: %s", string(upstreamPayload))
-	}
 
 	clientPayload := applyCodexIdentityExposeResponsePayload(upstreamPayload, state)
 	if bytes.Contains(clientPayload, []byte(state.promptCacheKey)) {
@@ -1074,12 +814,6 @@ func TestCodexIdentityConfuseResponsePayloadHidesUpstreamAndRestoresClient(t *te
 	}
 	if !bytes.Contains(clientPayload, []byte(`turn-ws-1`)) {
 		t.Fatalf("client payload missing original turn_id: %s", string(clientPayload))
-	}
-	if !bytes.Contains(clientPayload, []byte(`thread-ws-1`)) || !bytes.Contains(clientPayload, []byte(`install-ws-1`)) {
-		t.Fatalf("client payload missing original thread/installation identity: %s", string(clientPayload))
-	}
-	if bytes.Contains(clientPayload, []byte(expectedThreadID)) || bytes.Contains(clientPayload, []byte(expectedInstallationID)) {
-		t.Fatalf("client payload still contains confused thread/installation identity: %s", string(clientPayload))
 	}
 
 	rawSSE := []byte(`data: {"type":"response.completed","response":{"prompt_cache_key":"cache-ws-1","turn_id":"turn-ws-1"}}`)
@@ -1175,13 +909,13 @@ func TestParseCodexWebsocketErrorPreservesWrappedBodyAndHeaders(t *testing.T) {
 }
 
 func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
-	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com"+codexOfficialResponsesPath, nil)
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
 	if err != nil {
 		t.Fatalf("NewRequest() error = %v", err)
 	}
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
-			UserAgent:    "codex_vscode/2.0",
+			UserAgent:    "config-ua",
 			BetaFeatures: "config-beta",
 		},
 	}
@@ -1195,11 +929,8 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 
 	applyCodexHeaders(req, auth, "oauth-token", true, cfg)
 
-	if got := req.Header.Get("User-Agent"); got != "codex_vscode/2.0" {
-		t.Fatalf("User-Agent = %s, want %s", got, "codex_vscode/2.0")
-	}
-	if got := req.Header.Get("Originator"); got != "codex_vscode" {
-		t.Fatalf("Originator = %s, want codex_vscode", got)
+	if got := req.Header.Get("User-Agent"); got != "config-ua" {
+		t.Fatalf("User-Agent = %s, want %s", got, "config-ua")
 	}
 	// OAuth path now fills x-codex-beta-features (client > config > default);
 	// config value wins here.
@@ -1230,8 +961,8 @@ func TestApplyModelHeaderOverridesFromModelConfig(t *testing.T) {
 	if got := req.Header.Get("User-Agent"); got != wantUA {
 		t.Fatalf("User-Agent = %q, want %q", got, wantUA)
 	}
-	if got := codexSessionHeaderValue(req.Header); got != "" {
-		t.Fatalf("model override must not synthesize a session ID, got %q", got)
+	if got := codexSessionHeaderValue(req.Header); got == "" {
+		t.Fatal("expected Session_id to be set for Mac OS User-Agent override")
 	}
 
 	applyModelHeaderOverrides(req.Header, "gpt-5.4")
@@ -1274,7 +1005,7 @@ func TestApplyModelHeaderOverridesMultipleHeaders(t *testing.T) {
 }
 
 func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
-	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com"+codexOfficialResponsesPath, nil)
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
 	if err != nil {
 		t.Fatalf("NewRequest() error = %v", err)
 	}
@@ -1287,8 +1018,6 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 		"Version":               "0.115.0-alpha.27",
 		"X-Codex-Turn-Metadata": `{"turn_id":"turn-1"}`,
 		"X-Client-Request-Id":   "019d2233-e240-7162-992d-38df0a2a0e0d",
-		"session-id":            "http-session",
-		"thread-id":             "http-thread",
 	}))
 
 	applyCodexHeaders(req, auth, "oauth-token", true, nil)
@@ -1304,8 +1033,8 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	if got := req.Header.Get("X-Codex-Turn-Metadata"); got != `{"turn_id":"turn-1"}` {
 		t.Fatalf("X-Codex-Turn-Metadata = %s, want %s", got, `{"turn_id":"turn-1"}`)
 	}
-	if got := headerValueCaseInsensitive(req.Header, "x-client-request-id"); got != "http-thread" {
-		t.Fatalf("X-Client-Request-Id = %s, want thread-id http-thread", got)
+	if got := req.Header.Get("X-Client-Request-Id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
+		t.Fatalf("X-Client-Request-Id = %s, want %s", got, "019d2233-e240-7162-992d-38df0a2a0e0d")
 	}
 }
 

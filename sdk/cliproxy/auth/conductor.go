@@ -2643,9 +2643,6 @@ func (m *Manager) Load(ctx context.Context) error {
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	if opts.Metadata == nil {
-		opts.Metadata = make(map[string]any)
-	}
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -2655,7 +2652,6 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
-	opts = ensureRequestedModelMetadata(opts, retryModel)
 	for attempt := 0; ; attempt++ {
 		resp, errExec := m.executeMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
 		if errExec == nil {
@@ -2722,9 +2718,6 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 const slowStreamSetupThreshold = 5 * time.Second
 
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	if opts.Metadata == nil {
-		opts.Metadata = make(map[string]any)
-	}
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -2752,7 +2745,6 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
-	opts = ensureRequestedModelMetadata(opts, retryModel)
 	for attempt := 0; ; attempt++ {
 		attempts++
 		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)

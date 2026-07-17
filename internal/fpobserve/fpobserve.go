@@ -23,8 +23,6 @@ type Record struct {
 	UserAgent  string `json:"user_agent"`
 	Originator string `json:"originator,omitempty"`
 	SessionHdr string `json:"session_hdr,omitempty"`
-	ThreadHdr  string `json:"thread_hdr,omitempty"`
-	ClientReq  string `json:"client_request_id,omitempty"`
 	AccountID  string `json:"account_id,omitempty"`
 	AcceptEnc  string `json:"accept_enc"`
 	// Claude-only extras (empty for codex/antigravity).
