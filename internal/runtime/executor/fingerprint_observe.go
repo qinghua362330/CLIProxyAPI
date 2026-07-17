@@ -83,6 +83,16 @@ func fpSessionShape(h http.Header) string {
 	return "none"
 }
 
+// fpThreadShape reports only the exact thread-id key form, never its value.
+func fpThreadShape(h http.Header) string {
+	for k := range h {
+		if lk := strings.ToLower(k); lk == "thread-id" || lk == "thread_id" {
+			return k
+		}
+	}
+	return "none"
+}
+
 func fpPresence(h http.Header, name string) string {
 	if fpHeaderRaw(h, name) != "" {
 		return "present"
@@ -123,6 +133,8 @@ func observeCodexFingerprint(cfg *config.Config, auth *cliproxyauth.Auth, r *htt
 		UserAgent:  fpHeaderRaw(h, "User-Agent"),
 		Originator: fpHeaderRaw(h, "Originator"),
 		SessionHdr: fpSessionShape(h),
+		ThreadHdr:  fpThreadShape(h),
+		ClientReq:  fpPresence(h, "x-client-request-id"),
 		AccountID:  fpPresence(h, "chatgpt-account-id"),
 		AcceptEnc:  fpHeaderRaw(h, "Accept-Encoding"),
 	}
@@ -134,6 +146,7 @@ func observeCodexFingerprint(cfg *config.Config, auth *cliproxyauth.Auth, r *htt
 		"kind": "codex", "account": rec.Account, "host": rec.Host,
 		"tls_profile": rec.TLSProfile, "user_agent": rec.UserAgent,
 		"originator": rec.Originator, "session_hdr": rec.SessionHdr,
+		"thread_hdr": rec.ThreadHdr, "client_request_id": rec.ClientReq,
 		"account_id": rec.AccountID, "accept_enc": rec.AcceptEnc,
 	}).Info("[FP-OBSERVE] codex outbound fingerprint")
 }

@@ -31,10 +31,11 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	}
 	url := "https://example.com/responses"
 
-	httpReq, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, nil, req, req.Payload, rawJSON)
+	httpReq, _, identityState, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, nil, req, req.Payload, rawJSON)
 	if err != nil {
 		t.Fatalf("cacheHelper error: %v", err)
 	}
+	applyCodexManagedRequestHeaders(httpReq, nil, "", true, nil, req.Model, nil, &identityState)
 
 	body, errRead := io.ReadAll(httpReq.Body)
 	if errRead != nil {
@@ -98,14 +99,16 @@ func TestCodexExecutorCacheHelper_ClaudeUsesClaudeCodeSessionID(t *testing.T) {
 		}`),
 	}
 
-	firstHTTPReq, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("claude"), url, nil, firstReq, firstReq.Payload, rawJSON)
+	firstHTTPReq, _, firstIdentityState, err := executor.cacheHelper(ctx, sdktranslator.FromString("claude"), url, nil, firstReq, firstReq.Payload, rawJSON)
 	if err != nil {
 		t.Fatalf("cacheHelper first error: %v", err)
 	}
-	secondHTTPReq, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("claude"), url, nil, secondReq, secondReq.Payload, rawJSON)
+	secondHTTPReq, _, secondIdentityState, err := executor.cacheHelper(ctx, sdktranslator.FromString("claude"), url, nil, secondReq, secondReq.Payload, rawJSON)
 	if err != nil {
 		t.Fatalf("cacheHelper second error: %v", err)
 	}
+	applyCodexManagedRequestHeaders(firstHTTPReq, nil, "", true, nil, firstReq.Model, nil, &firstIdentityState)
+	applyCodexManagedRequestHeaders(secondHTTPReq, nil, "", true, nil, secondReq.Model, nil, &secondIdentityState)
 
 	firstBody, errRead := io.ReadAll(firstHTTPReq.Body)
 	if errRead != nil {
@@ -185,8 +188,7 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	if err != nil {
 		t.Fatalf("cacheHelper error: %v", err)
 	}
-	applyCodexHeaders(httpReq, auth, "oauth-token", true, executor.cfg)
-	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	applyCodexManagedRequestHeaders(httpReq, auth, "oauth-token", true, executor.cfg, req.Model, nil, &identityState)
 
 	expectedPromptCacheKey := codexIdentityConfuseUUID("auth-1", "prompt-cache", "cache-1")
 	expectedTurnID := codexIdentityConfuseUUID("auth-1", "turn", "turn-1")
@@ -216,8 +218,8 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	if gotHeader := httpReq.Header["thread-id"]; len(gotHeader) != 1 || gotHeader[0] != expectedPromptCacheKey {
 		t.Fatalf("thread-id = %#v, want [%q]", gotHeader, expectedPromptCacheKey)
 	}
-	if gotHeader := httpReq.Header.Get("X-Client-Request-Id"); gotHeader != expectedPromptCacheKey {
-		t.Fatalf("X-Client-Request-Id = %q, want %q", gotHeader, expectedPromptCacheKey)
+	if gotHeader := headerValueCaseInsensitive(httpReq.Header, "x-client-request-id"); gotHeader != "client-request-1" {
+		t.Fatalf("x-client-request-id = %q, want explicit client-request-1", gotHeader)
 	}
 	if gotCanonicalSession := httpReq.Header.Get("Session-Id"); gotCanonicalSession != "" {
 		t.Fatalf("Session-Id = %q, want empty", gotCanonicalSession)

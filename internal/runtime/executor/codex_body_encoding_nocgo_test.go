@@ -36,7 +36,7 @@ func TestCacheHelper_NoCGOPlaintextFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cacheHelper() error = %v", err)
 	}
-	applyCodexManagedRequestHeaders(httpReq, auth, "token", true, nil, req.Model, nil)
+	applyCodexManagedRequestHeaders(httpReq, auth, "token", true, nil, req.Model, nil, nil)
 
 	wireBody, err := io.ReadAll(httpReq.Body)
 	if err != nil {

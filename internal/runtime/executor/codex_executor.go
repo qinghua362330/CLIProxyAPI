@@ -829,7 +829,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, err
 	}
-	applyCodexManagedRequestHeaders(httpReq, auth, apiKey, true, e.cfg, baseModel, &identityState)
+	applyCodexManagedRequestHeaders(httpReq, auth, apiKey, true, e.cfg, baseModel, opts.Headers, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -998,7 +998,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
-	applyCodexManagedRequestHeaders(httpReq, auth, apiKey, false, e.cfg, baseModel, &identityState)
+	applyCodexManagedRequestHeaders(httpReq, auth, apiKey, false, e.cfg, baseModel, opts.Headers, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -1112,7 +1112,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
-	applyCodexManagedRequestHeaders(httpReq, auth, apiKey, true, e.cfg, baseModel, &identityState)
+	applyCodexManagedRequestHeaders(httpReq, auth, apiKey, true, e.cfg, baseModel, opts.Headers, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -1436,6 +1436,7 @@ type codexIdentityConfuseState struct {
 	authID                 string
 	originalPromptCacheKey string
 	promptCacheKey         string
+	headerPromptCacheKey   string
 	turnIDs                []codexIdentityReplacement
 }
 
@@ -1473,6 +1474,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if identityState.promptCacheKey != "" {
 		cache.ID = identityState.promptCacheKey
 	}
+	identityState.headerPromptCacheKey = strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt_cache_key").String())
 	// Only the wire body is compressed; rawJSON remains plaintext for logging and
 	// accounting. Request-local state lets the final send step restore the matching
 	// Content-Encoding after custom headers and model overrides.
@@ -1480,11 +1482,6 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	httpReq, err := codexNewBodyRequest(ctx, url, rawJSON, managedEncoding, codexShouldZstdBody(auth, e.cfg, url), codexZstdCompress)
 	if err != nil {
 		return nil, nil, codexIdentityConfuseState{}, err
-	}
-	if cache.ID != "" {
-		// Real codex 0.142.5 shape (lowercase session-id + thread-id, no
-		// Conversation_id), identical to the WS path; h2 lowercases on the wire.
-		setCodexSessionThreadHeaders(httpReq.Header, cache.ID)
 	}
 	return httpReq, rawJSON, identityState, nil
 }
@@ -1530,11 +1527,6 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 		return
 	}
 
-	// Real codex 0.142.5 shape: lowercase hyphenated session-id + thread-id (same
-	// UUID), NO Conversation_id / Thread-Id. Remap the identity-confuse UUID onto
-	// the real header names so confused output still matches a genuine client.
-	setCodexSessionThreadHeaders(headers, state.promptCacheKey)
-	headers.Set("X-Client-Request-Id", state.promptCacheKey)
 	headers.Set("X-Codex-Window-Id", state.promptCacheKey+":0")
 }
 
@@ -1610,22 +1602,45 @@ func codexIdentityConfuseUUID(authID string, kind string, value string) string {
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String()
 }
 
-func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {
-	var ginHeaders http.Header
-	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-		ginHeaders = ginCtx.Request.Header
+func codexRequestHeaderSource(ctx context.Context, explicitHeaders http.Header) http.Header {
+	if explicitHeaders != nil {
+		return explicitHeaders
 	}
-	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		return ginCtx.Request.Header
+	}
+	return nil
+}
+
+func codexFallbackUserAgent(auth *cliproxyauth.Auth, cfg *config.Config) string {
+	return helps.PerAccountCodexUserAgent(helps.AccountFingerprintKey(auth, ""), codexUserAgent, cfg)
+}
+
+func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {
+	sourceHeaders := codexRequestHeaderSource(r.Context(), nil)
+	pairOAuthIdentity := codexShouldPairOAuthIdentity(auth, r.URL.String())
+	applyCodexHeadersFromSources(r, auth, token, stream, cfg, sourceHeaders, pairOAuthIdentity)
+	finalizeCodexRequestHeaders(r.Header, sourceHeaders, "", pairOAuthIdentity, codexFallbackUserAgent(auth, cfg))
+	finalizeCodexContentEncoding(r)
+	observeCodexFingerprint(cfg, auth, r)
 }
 
 // applyCodexManagedRequestHeaders owns the final header sequence for managed
 // Responses and compact requests. Finalization must remain last so body encoding
 // cannot be desynchronized by auth custom headers or model overrides.
-func applyCodexManagedRequestHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, modelName string, identityState *codexIdentityConfuseState) {
-	applyCodexHeaders(r, auth, token, stream, cfg)
+func applyCodexManagedRequestHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, modelName string, explicitHeaders http.Header, identityState *codexIdentityConfuseState) {
+	sourceHeaders := codexRequestHeaderSource(r.Context(), explicitHeaders)
+	pairOAuthIdentity := codexShouldPairOAuthIdentity(auth, r.URL.String())
+	applyCodexHeadersFromSources(r, auth, token, stream, cfg, sourceHeaders, pairOAuthIdentity)
 	applyModelHeaderOverrides(r.Header, modelName)
 	applyCodexIdentityConfuseHeaders(r.Header, identityState)
+	promptCacheFallback := ""
+	if identityState != nil {
+		promptCacheFallback = identityState.headerPromptCacheKey
+	}
+	finalizeCodexRequestHeaders(r.Header, sourceHeaders, promptCacheFallback, pairOAuthIdentity, codexFallbackUserAgent(auth, cfg))
 	finalizeCodexContentEncoding(r)
+	observeCodexFingerprint(cfg, auth, r)
 }
 
 // applyModelHeaderOverrides forces models.json config.override_header onto upstream headers.
@@ -1640,72 +1655,56 @@ func applyModelHeaderOverrides(headers http.Header, modelName string) {
 	for key, value := range overrides {
 		headers.Set(key, value)
 	}
-	if strings.Contains(headers.Get("User-Agent"), "Mac OS") && codexSessionHeaderValue(headers) == "" {
-		headers.Set("Session_id", uuid.NewString())
-	}
 }
 
-// applyCodexDirectImageHeaders sets Codex upstream headers for direct /images/* calls.
-// Downstream client User-Agent values are not forwarded to reduce Cloudflare 1010 blocks.
-func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {
-	var ginHeaders http.Header
-	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-		ginHeaders = ginCtx.Request.Header.Clone()
-		ginHeaders.Del("User-Agent")
+// applyCodexDirectImageHeaders applies the same client-identity finalization as
+// the other managed Codex paths while retaining the direct image content policy.
+func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, modelName string, explicitHeaders http.Header, identityState *codexIdentityConfuseState) {
+	sourceHeaders := codexRequestHeaderSource(r.Context(), explicitHeaders)
+	pairOAuthIdentity := codexShouldPairOAuthIdentity(auth, r.URL.String())
+	applyCodexHeadersFromSources(r, auth, token, stream, cfg, sourceHeaders, pairOAuthIdentity)
+	applyModelHeaderOverrides(r.Header, modelName)
+	applyCodexIdentityConfuseHeaders(r.Header, identityState)
+	promptCacheFallback := ""
+	if identityState != nil {
+		promptCacheFallback = identityState.headerPromptCacheKey
 	}
-	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
+	finalizeCodexRequestHeaders(r.Header, sourceHeaders, promptCacheFallback, pairOAuthIdentity, codexFallbackUserAgent(auth, cfg))
+	finalizeCodexContentEncoding(r)
+	observeCodexFingerprint(cfg, auth, r)
 }
 
-func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, ginHeaders http.Header) {
+func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, sourceHeaders http.Header, pairOAuthIdentity bool) {
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer "+token)
 
-	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
+	misc.EnsureHeader(r.Header, sourceHeaders, "Version", "")
+	misc.EnsureHeader(r.Header, sourceHeaders, "X-Codex-Turn-Metadata", "")
 	cfgUserAgent, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
 	// Preserve the existing legacy API-key split for UA and beta-feature behavior;
 	// request-body compression uses stricter AuthKind and target URL gates.
 	isAPIKey := codexAuthIsAPIKey(auth)
-	if isAPIKey {
+	if isAPIKey || !pairOAuthIdentity {
 		// BYOK/API-key requests hit the user's own OpenAI-compatible endpoint;
-		// forward the client User-Agent as-is (config/default fill in when absent).
-		ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
+		// custom OAuth upstreams share the same raw client-identity behavior.
+		ensureHeaderWithConfigPrecedence(r.Header, sourceHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
 	} else {
-		// OAuth requests impersonate the official Codex CLI to the ChatGPT backend;
-		// never forward a foreign downstream User-Agent (see ensureCodexUserAgent).
-		ensureCodexUserAgent(r.Header, ginHeaders, cfgUserAgent, helps.PerAccountCodexUserAgent(helps.AccountFingerprintKey(auth, ""), codexUserAgent, cfg))
+		// Preserve the highest-precedence candidate until the shared finalizer can
+		// derive User-Agent and Originator from one validated client identity.
+		ensureHeaderWithConfigPrecedence(r.Header, sourceHeaders, "User-Agent", cfgUserAgent, codexFallbackUserAgent(auth, cfg))
 		// beta-features default only on OAuth (ChatGPT backend), consistent with the
 		// WS path — keeps the HTTP fallback from being a missing-header tell.
-		ensureHeaderWithPriority(r.Header, ginHeaders, "X-Codex-Beta-Features", cfgBetaFeatures, codexDefaultBetaFeatures)
+		ensureHeaderWithPriority(r.Header, sourceHeaders, "X-Codex-Beta-Features", cfgBetaFeatures, codexDefaultBetaFeatures)
 	}
-
-	// Real codex 0.142.5: lowercase hyphenated session-id + thread-id (same UUID),
-	// no Session_id/Conversation_id. Reuse the WS normalizer so the HTTP fallback
-	// (hit when WS upgrade fails — when detection is strictest) emits an identical
-	// shape. h2 lowercases header names on the wire.
-	sid := codexSessionHeaderValue(r.Header)
-	if sid == "" {
-		sid = codexSessionHeaderValue(ginHeaders)
-	}
-	if sid == "" {
-		// Real codex ALWAYS emits session-id/thread-id regardless of OS — a missing
-		// session-id is itself a strong tell. This is the last-resort fallback: the
-		// cache.ID path (request builder ~L1475) and the identity-confuse
-		// promptCacheKey path already supply a per-conversation stable id upstream of
-		// here, so this random UUID only fires when no conversation context exists at
-		// all. The old `&& strings.Contains(UA, "Mac OS")` gate could leave the header
-		// absent on non-macOS UAs, which is worse than a random-but-present id.
-		sid = uuid.NewString()
-	}
-	setCodexSessionThreadHeaders(r.Header, sid)
 
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
 	} else {
 		r.Header.Set("Accept", "application/json")
 	}
-	setCodexOriginator(r.Header, ginHeaders.Get("Originator"), isAPIKey)
+	if isAPIKey || !pairOAuthIdentity {
+		setCodexRawOriginator(r.Header, headerValueCaseInsensitive(sourceHeaders, "Originator"))
+	}
 	if !isAPIKey {
 		if auth != nil && auth.Metadata != nil {
 			if accountID, ok := auth.Metadata["account_id"].(string); ok {
@@ -1719,10 +1718,6 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 
-	// LOG-ONLY: sampled outbound fingerprint observability (off by default). Placed at the
-	// end of header application so it sees the final per-account UA/originator/session/
-	// account-id. Never mutates the request.
-	observeCodexFingerprint(cfg, auth, r)
 }
 
 // sendTerminalChunk delivers a terminal chunk carrying the final upstream status
