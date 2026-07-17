@@ -1554,6 +1554,21 @@ func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexI
 	if state.promptCacheKey != "" && gjson.Get(rawTurnMetadata, "window_id").Exists() {
 		updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "window_id", state.promptCacheKey+":0")
 	}
+	// installation_id is stable for the life of a Codex install, so an unconfused one
+	// is the strongest cross-account correlation anchor there is: every account in the
+	// pool would carry the same value for a given downstream client. The
+	// client_metadata.x-codex-installation-id path never covers it — a real client
+	// (Codex Desktop 0.144.x, live-captured 2026-07-17) sends installation_id ONLY here,
+	// in x-codex-turn-metadata, and sends no client_metadata at all. The ReplaceAll above
+	// cannot reach it either, since installation_id never equals prompt_cache_key.
+	// Same "installation" kind as the body path so both agree when both are present.
+	// Guard on authID: a blank one would hash identically for every account, i.e.
+	// confused-looking but still a perfect correlation anchor.
+	if strings.TrimSpace(state.authID) != "" {
+		if installationID := strings.TrimSpace(gjson.Get(rawTurnMetadata, "installation_id").String()); installationID != "" {
+			updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "installation_id", codexIdentityConfuseUUID(state.authID, "installation", installationID))
+		}
+	}
 	return updatedTurnMetadata
 }
 
