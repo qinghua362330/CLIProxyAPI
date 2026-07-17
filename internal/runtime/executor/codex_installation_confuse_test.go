@@ -146,3 +146,35 @@ func TestIdentityConfuse_BlankAuthIDLeavesInstallationIDAlone(t *testing.T) {
 		t.Fatalf("installation_id = %q with a blank authID; want it untouched (%q)", got, realInboundInstallationID)
 	}
 }
+
+// The remapped installation_id must not merely differ from the original — it must look
+// like one a real client could have generated. Codex generates it randomly, so a live
+// capture shows version 4 (6ae1cc61-7e89-4a8c-…). uuid.NewSHA1 alone yields version 5,
+// which no real install id has: a half-correct impersonation is its own tell.
+func TestIdentityConfuse_InstallationIDKeepsRealClientUUIDVersion(t *testing.T) {
+	if got, want := realInboundInstallationID[14], byte('4'); got != want {
+		t.Fatalf("fixture drift: captured installation_id %q is version %c, not %c", realInboundInstallationID, got, want)
+	}
+	turnMetadata, _, _ := outboundForAuth(t, "pool-account-42")
+	got := gjson.Get(turnMetadata, "installation_id").String()
+	if len(got) != 36 {
+		t.Fatalf("installation_id = %q, want a 36-char hyphenated UUID", got)
+	}
+	if got[14] != '4' {
+		t.Fatalf("installation_id = %q (version %c); a real client only ever emits version 4", got, got[14])
+	}
+}
+
+// A real install id never changes, so the remap must be deterministic: same account and
+// same original id must always yield the same value. A per-request random one would
+// defeat correlation but is itself a tell no real client produces.
+func TestIdentityConfuse_InstallationIDIsStableAcrossRequests(t *testing.T) {
+	first, _, _ := outboundForAuth(t, "pool-account-42")
+	second, _, _ := outboundForAuth(t, "pool-account-42")
+
+	a := gjson.Get(first, "installation_id").String()
+	b := gjson.Get(second, "installation_id").String()
+	if a != b {
+		t.Fatalf("installation_id drifted between requests for one account: %q then %q", a, b)
+	}
+}
