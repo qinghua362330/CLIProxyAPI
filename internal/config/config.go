@@ -343,6 +343,9 @@ type FingerprintObserveConfig struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+	// RequestCompression defaults to enabled when unset in CGO builds. Set it to
+	// false to force plaintext for official Codex OAuth /responses requests.
+	RequestCompression *bool `yaml:"request-compression,omitempty" json:"request-compression,omitempty"`
 }
 
 // XAIConfig holds provider-wide xAI (Grok) behavior toggles.

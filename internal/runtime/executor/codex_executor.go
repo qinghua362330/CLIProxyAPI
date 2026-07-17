@@ -757,10 +757,14 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if ctx == nil {
 		ctx = req.Context()
 	}
+	if encodingState, ok := codexBodyEncodingStateFromRequest(req); ok {
+		ctx = withCodexBodyEncodingState(ctx, encodingState)
+	}
 	httpReq := req.WithContext(ctx)
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
+	finalizeCodexContentEncoding(httpReq)
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
@@ -825,9 +829,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
-	applyModelHeaderOverrides(httpReq.Header, baseModel)
-	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	applyCodexManagedRequestHeaders(httpReq, auth, apiKey, true, e.cfg, baseModel, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -996,9 +998,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
-	applyModelHeaderOverrides(httpReq.Header, baseModel)
-	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	applyCodexManagedRequestHeaders(httpReq, auth, apiKey, false, e.cfg, baseModel, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -1112,9 +1112,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
-	applyModelHeaderOverrides(httpReq.Header, baseModel)
-	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	applyCodexManagedRequestHeaders(httpReq, auth, apiKey, true, e.cfg, baseModel, &identityState)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -1475,26 +1473,13 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if identityState.promptCacheKey != "" {
 		cache.ID = identityState.promptCacheKey
 	}
-	// Real codex 0.142.5 zstd-compresses the POST body and sends
-	// content-encoding: zstd on the OAuth path (live-captured on the HTTP
-	// fallback). Mirror it so the body size/entropy AND the header match a genuine
-	// client; BYOK/API-key endpoints stay plaintext. Only the wire body is
-	// compressed — the returned rawJSON stays plaintext for request logging.
-	wireBody := rawJSON
-	zstdEncoded := false
-	if codexShouldZstdBody(auth) {
-		if compressed, ok := codexZstdCompress(rawJSON); ok {
-			wireBody = compressed
-			zstdEncoded = true
-		}
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(wireBody))
+	// Only the wire body is compressed; rawJSON remains plaintext for logging and
+	// accounting. Request-local state lets the final send step restore the matching
+	// Content-Encoding after custom headers and model overrides.
+	managedEncoding := codexManagedBodyEncoding(from, url)
+	httpReq, err := codexNewBodyRequest(ctx, url, rawJSON, managedEncoding, codexShouldZstdBody(auth, e.cfg, url), codexZstdCompress)
 	if err != nil {
 		return nil, nil, codexIdentityConfuseState{}, err
-	}
-	if zstdEncoded {
-		// h2 lowercases the header name on the wire → content-encoding: zstd.
-		httpReq.Header.Set("Content-Encoding", "zstd")
 	}
 	if cache.ID != "" {
 		// Real codex 0.142.5 shape (lowercase session-id + thread-id, no
@@ -1633,6 +1618,16 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
 }
 
+// applyCodexManagedRequestHeaders owns the final header sequence for managed
+// Responses and compact requests. Finalization must remain last so body encoding
+// cannot be desynchronized by auth custom headers or model overrides.
+func applyCodexManagedRequestHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, modelName string, identityState *codexIdentityConfuseState) {
+	applyCodexHeaders(r, auth, token, stream, cfg)
+	applyModelHeaderOverrides(r.Header, modelName)
+	applyCodexIdentityConfuseHeaders(r.Header, identityState)
+	finalizeCodexContentEncoding(r)
+}
+
 // applyModelHeaderOverrides forces models.json config.override_header onto upstream headers.
 func applyModelHeaderOverrides(headers http.Header, modelName string) {
 	if headers == nil {
@@ -1669,8 +1664,8 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
 	cfgUserAgent, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
-	// Same OAuth-vs-API-key split as codexShouldZstdBody, so the impersonation
-	// decisions (UA, beta-features, body zstd) stay consistent for a given auth.
+	// Preserve the existing legacy API-key split for UA and beta-feature behavior;
+	// request-body compression uses stricter AuthKind and target URL gates.
 	isAPIKey := codexAuthIsAPIKey(auth)
 	if isAPIKey {
 		// BYOK/API-key requests hit the user's own OpenAI-compatible endpoint;
