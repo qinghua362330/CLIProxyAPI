@@ -230,7 +230,17 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 	clientBody := body
 	var identityState codexIdentityConfuseState
-	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
+	upstreamBody := body
+	if codexShouldPairOAuthIdentity(auth, httpURL) {
+		upstreamBody, identityState = applyCodexManagedIdentityBody(
+			e.cfg,
+			auth,
+			codexRequestHeaderSource(ctx, opts.Headers),
+			codexRequestIdentityID(req, opts),
+			originalPayloadSource,
+			body,
+		)
+	}
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexManagedWebsocketHeaders(ctx, wsHeaders, opts.Headers, auth, apiKey, e.cfg, baseModel, &identityState, strings.TrimSpace(gjson.GetBytes(upstreamBody, "prompt_cache_key").String()), httpURL)
 
@@ -450,7 +460,17 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 	clientBody := body
 	var identityState codexIdentityConfuseState
-	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, body)
+	upstreamBody := body
+	if codexShouldPairOAuthIdentity(auth, httpURL) {
+		upstreamBody, identityState = applyCodexManagedIdentityBody(
+			e.cfg,
+			auth,
+			codexRequestHeaderSource(ctx, opts.Headers),
+			codexRequestIdentityID(req, opts),
+			userPayload,
+			body,
+		)
+	}
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	wsHeaders = applyCodexManagedWebsocketHeaders(ctx, wsHeaders, opts.Headers, auth, apiKey, e.cfg, baseModel, &identityState, strings.TrimSpace(gjson.GetBytes(upstreamBody, "prompt_cache_key").String()), httpURL)
 
@@ -488,6 +508,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		upstreamHeaders = respHS.Header.Clone()
 	}
 	if errDial != nil {
+		if sess != nil {
+			sess.reqMu.Unlock()
+		}
 		bodyErr := websocketHandshakeBody(respHS)
 		if respHS != nil {
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
@@ -499,9 +522,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			return nil, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
-		if sess != nil {
-			sess.reqMu.Unlock()
-		}
 		return nil, errDial
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
@@ -909,17 +929,22 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	targetURL := "https://chatgpt.com" + codexOfficialResponsesPath
 	pairOAuthIdentity := codexShouldPairOAuthIdentity(auth, targetURL)
 	headers = applyCodexWebsocketHeadersFromSources(headers, sourceHeaders, auth, token, cfg, pairOAuthIdentity)
-	finalizeCodexRequestHeaders(headers, sourceHeaders, "", pairOAuthIdentity, codexFallbackUserAgent(auth, cfg))
+	finalizeCodexRequestHeaders(headers, sourceHeaders, "", pairOAuthIdentity, codexShouldPairClientRequestID(targetURL), pairOAuthIdentity, codexFallbackUserAgent(auth, cfg))
 	return headers
 }
 
-func applyCodexManagedWebsocketHeaders(ctx context.Context, headers http.Header, explicitHeaders http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config, modelName string, identityState *codexIdentityConfuseState, promptCacheFallback string, targetURL string) http.Header {
+func applyCodexManagedWebsocketHeaders(ctx context.Context, headers http.Header, explicitHeaders http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config, modelName string, identityState *codexIdentityConfuseState, _ string, targetURL string) http.Header {
 	sourceHeaders := codexRequestHeaderSource(ctx, explicitHeaders)
 	pairOAuthIdentity := codexShouldPairOAuthIdentity(auth, targetURL)
 	headers = applyCodexWebsocketHeadersFromSources(headers, sourceHeaders, auth, token, cfg, pairOAuthIdentity)
 	applyModelHeaderOverrides(headers, modelName)
+	primeCodexRequestIdentityHeaders(headers, sourceHeaders)
 	applyCodexIdentityConfuseHeaders(headers, identityState)
-	finalizeCodexRequestHeaders(headers, sourceHeaders, promptCacheFallback, pairOAuthIdentity, codexFallbackUserAgent(auth, cfg))
+	requestIdentityFallback := ""
+	if identityState != nil {
+		requestIdentityFallback = identityState.requestIdentityID
+	}
+	finalizeCodexRequestHeaders(headers, sourceHeaders, requestIdentityFallback, pairOAuthIdentity, codexShouldPairClientRequestID(targetURL), pairOAuthIdentity, codexFallbackUserAgent(auth, cfg))
 	return headers
 }
 
@@ -1067,25 +1092,48 @@ func codexResolvedHeaderValue(target http.Header, source http.Header, value func
 	return value(source)
 }
 
-func finalizeCodexRequestHeaders(target http.Header, explicitSource http.Header, promptCacheFallback string, pairOAuthIdentity bool, fallbackUserAgent string) {
+func primeCodexRequestIdentityHeaders(target http.Header, source http.Header) {
+	if target == nil {
+		return
+	}
+	sessionID := codexResolvedHeaderValue(target, source, codexSessionHeaderValue)
+	threadID := codexResolvedHeaderValue(target, source, codexThreadHeaderValue)
+	clientRequestID := codexResolvedHeaderValue(target, source, codexClientRequestIDValue)
+	setCodexSessionThreadHeaders(target, sessionID, threadID)
+	setCodexClientRequestID(target, clientRequestID)
+}
+
+func finalizeCodexRequestHeaders(target http.Header, explicitSource http.Header, promptCacheFallback string, pairOAuthIdentity bool, pairClientRequestID bool, normalizeOAuthClient bool, fallbackUserAgent string) {
 	if target == nil {
 		return
 	}
 	sessionID := codexResolvedHeaderValue(target, explicitSource, codexSessionHeaderValue)
 	threadID := codexResolvedHeaderValue(target, explicitSource, codexThreadHeaderValue)
-	if sessionID == "" && threadID == "" {
+	if pairOAuthIdentity && sessionID == "" && threadID == "" {
 		if fallback := strings.TrimSpace(promptCacheFallback); fallback != "" {
 			sessionID = fallback
 			threadID = fallback
 		}
 	}
+	if pairOAuthIdentity {
+		switch {
+		case sessionID == "":
+			sessionID = threadID
+		case threadID == "":
+			threadID = sessionID
+		}
+	}
 	clientRequestID := codexResolvedHeaderValue(target, explicitSource, codexClientRequestIDValue)
-	if clientRequestID == "" {
-		clientRequestID = threadID
+	if pairOAuthIdentity {
+		if pairClientRequestID {
+			clientRequestID = threadID
+		} else {
+			clientRequestID = ""
+		}
 	}
 	setCodexSessionThreadHeaders(target, sessionID, threadID)
 	setCodexClientRequestID(target, clientRequestID)
-	if pairOAuthIdentity {
+	if normalizeOAuthClient {
 		finalizeCodexOAuthClientIdentity(target, fallbackUserAgent)
 	}
 }
@@ -1338,36 +1386,72 @@ func finalizeCodexOAuthClientIdentity(headers http.Header, fallbackUserAgent str
 }
 
 func codexOfficialIdentityTarget(targetURL string) bool {
-	parsed, err := url.Parse(strings.TrimSpace(targetURL))
-	if err != nil || parsed.Opaque != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawPath != "" {
-		return false
-	}
-	scheme := strings.ToLower(parsed.Scheme)
-	if scheme != "https" && scheme != "wss" {
-		return false
-	}
-	if !strings.EqualFold(parsed.Hostname(), "chatgpt.com") {
-		return false
-	}
-	if port := parsed.Port(); port != "" && port != "443" {
-		return false
-	}
-	if strings.HasSuffix(parsed.Host, ":") {
+	parsed, ok := codexOfficialTargetURL(targetURL)
+	if !ok {
 		return false
 	}
 	switch parsed.Path {
-	case codexOfficialResponsesPath,
-		codexOfficialCompactPath,
-		"/backend-api/codex" + codexDirectImagesGenerations,
-		"/backend-api/codex" + codexDirectImagesEdit:
-		return true
+	case codexOfficialResponsesPath:
+		return parsed.Scheme == "https" || parsed.Scheme == "wss"
+	case codexOfficialCompactPath:
+		return parsed.Scheme == "https"
 	default:
 		return false
 	}
 }
 
+func codexOfficialOAuthTarget(targetURL string) bool {
+	parsed, ok := codexOfficialTargetURL(targetURL)
+	if !ok {
+		return false
+	}
+	switch parsed.Path {
+	case codexOfficialResponsesPath:
+		return parsed.Scheme == "https" || parsed.Scheme == "wss"
+	case codexOfficialCompactPath,
+		"/backend-api/codex" + codexDirectImagesGenerations,
+		"/backend-api/codex" + codexDirectImagesEdit:
+		return parsed.Scheme == "https"
+	default:
+		return false
+	}
+}
+
+func codexOfficialTargetURL(targetURL string) (*url.URL, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(targetURL))
+	if err != nil || parsed.Opaque != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawPath != "" {
+		return nil, false
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "https" && scheme != "wss" {
+		return nil, false
+	}
+	if !strings.EqualFold(parsed.Hostname(), "chatgpt.com") {
+		return nil, false
+	}
+	if port := parsed.Port(); port != "" && port != "443" {
+		return nil, false
+	}
+	if strings.HasSuffix(parsed.Host, ":") {
+		return nil, false
+	}
+	return parsed, true
+}
+
 func codexShouldPairOAuthIdentity(auth *cliproxyauth.Auth, targetURL string) bool {
-	return !codexAuthIsAPIKey(auth) && codexOfficialIdentityTarget(targetURL)
+	return auth != nil && auth.AuthKind() == cliproxyauth.AuthKindOAuth && codexOfficialIdentityTarget(targetURL)
+}
+
+func codexShouldNormalizeOAuthClientIdentity(auth *cliproxyauth.Auth, targetURL string) bool {
+	return auth != nil && auth.AuthKind() == cliproxyauth.AuthKindOAuth && codexOfficialOAuthTarget(targetURL)
+}
+
+func codexShouldPairClientRequestID(targetURL string) bool {
+	if !codexOfficialIdentityTarget(targetURL) {
+		return false
+	}
+	parsed, err := url.Parse(strings.TrimSpace(targetURL))
+	return err == nil && parsed.Path != codexOfficialCompactPath
 }
 
 type statusErrWithHeaders struct {

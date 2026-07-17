@@ -177,7 +177,7 @@ func TestCodexExecutorDirectOpenAIImageCustomOAuthPreservesRawIdentity(t *testin
 	}
 }
 
-func TestCodexExecutorDirectOpenAIImageOfficialOAuthPairsIdentityOnWire(t *testing.T) {
+func TestCodexExecutorDirectOpenAIImageOfficialOAuthOmitsResponsesIdentityOnWire(t *testing.T) {
 	tests := []struct {
 		name           string
 		userAgent      string
@@ -222,8 +222,16 @@ func TestCodexExecutorDirectOpenAIImageOfficialOAuthPairsIdentityOnWire(t *testi
 			}
 			opts := codexOpenAIImageTestOptions(codexImagesGenerationsPath, false)
 			opts.Headers = http.Header{
-				"User-Agent": []string{tc.userAgent},
-				"Originator": []string{"must-be-replaced"},
+				"User-Agent":               []string{tc.userAgent},
+				"Originator":               []string{"must-be-replaced"},
+				"session-id":               []string{"must-not-leak-session"},
+				"thread-id":                []string{"must-not-leak-thread"},
+				"x-client-request-id":      []string{"must-not-leak-client"},
+				"X-Codex-Installation-Id":  []string{"must-not-leak-installation"},
+				"X-Codex-Window-Id":        []string{"must-not-leak-thread:3"},
+				"X-Codex-Parent-Thread-Id": []string{"must-not-leak-parent"},
+				"X-Codex-Turn-Metadata":    []string{`{"thread_id":"must-not-leak-thread"}`},
+				"X-Codex-Turn-State":       []string{"must-not-leak-state"},
 			}
 			_, err := NewCodexExecutor(&config.Config{}).Execute(ctx, auth, cliproxyexecutor.Request{
 				Model:   "gpt-image-1.5",
@@ -238,6 +246,26 @@ func TestCodexExecutorDirectOpenAIImageOfficialOAuthPairsIdentityOnWire(t *testi
 			}
 			if got := headers.Get("Originator"); got != tc.wantOriginator {
 				t.Fatalf("wire Originator = %q, want %q", got, tc.wantOriginator)
+			}
+			if got := codexSessionHeaderValue(headers); got != "" {
+				t.Fatalf("wire session-id = %q, want absent for standalone Images API", got)
+			}
+			if got := codexThreadHeaderValue(headers); got != "" {
+				t.Fatalf("wire thread-id = %q, want absent for standalone Images API", got)
+			}
+			if got := codexClientRequestIDValue(headers); got != "" {
+				t.Fatalf("wire X-Client-Request-Id = %q, want absent for standalone Images API", got)
+			}
+			for _, key := range []string{
+				"X-Codex-Installation-Id",
+				"X-Codex-Window-Id",
+				"X-Codex-Parent-Thread-Id",
+				"X-Codex-Turn-Metadata",
+				"X-Codex-Turn-State",
+			} {
+				if got := headerValueCaseInsensitive(headers, key); got != "" {
+					t.Fatalf("wire %s = %q, want absent for standalone Images API", key, got)
+				}
 			}
 		})
 	}

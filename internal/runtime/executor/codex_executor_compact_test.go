@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -76,5 +77,59 @@ func TestCodexExecutorCompactAddsDefaultInstructionsWithoutInjectingImageTool(t 
 				t.Fatalf("payload = %s", string(resp.Payload))
 			}
 		})
+	}
+}
+
+func TestCodexCompactDropsClientMetadataBodyAndKeepsCompatibilityHeaders(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{})
+	auth := explicitOAuthAuth()
+	turnMetadata := `{"installation_id":"install-compact","session_id":"session-compact","thread_id":"thread-compact","turn_id":"turn-compact","window_id":"thread-compact:4","parent_thread_id":"parent-compact"}`
+	payload := []byte(`{"model":"gpt-5.6","prompt_cache_key":"thread-compact","input":[],"client_metadata":{"session_id":"flat-session","thread_id":"flat-thread","x-codex-turn-metadata":` + strconv.Quote(turnMetadata) + `}}`)
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Headers: http.Header{
+			"session-id":               []string{"header-session"},
+			"thread-id":                []string{"header-thread"},
+			"X-Codex-Installation-Id":  []string{"header-install"},
+			"X-Codex-Window-Id":        []string{"header-thread:9"},
+			"X-Codex-Parent-Thread-Id": []string{"header-parent"},
+		},
+		Metadata: map[string]any{cliproxyexecutor.CodexRequestIdentityMetadataKey: "request-compact"},
+	}
+
+	httpReq, body, state, err := executor.cacheHelper(
+		context.Background(),
+		opts.SourceFormat,
+		"https://chatgpt.com"+codexOfficialCompactPath,
+		auth,
+		cliproxyexecutor.Request{Model: "gpt-5.6", Payload: payload},
+		payload,
+		payload,
+		opts,
+	)
+	if err != nil {
+		t.Fatalf("cacheHelper error: %v", err)
+	}
+	if gjson.GetBytes(body, "client_metadata").Exists() {
+		t.Fatalf("compact body contains client_metadata: %s", body)
+	}
+	applyCodexManagedRequestHeaders(httpReq, auth, "oauth-token", false, executor.cfg, "gpt-5.6", opts.Headers, &state)
+	if got := codexSessionHeaderValue(httpReq.Header); got != "session-compact" {
+		t.Fatalf("session-id = %q, want session-compact", got)
+	}
+	if got := codexThreadHeaderValue(httpReq.Header); got != "thread-compact" {
+		t.Fatalf("thread-id = %q, want thread-compact", got)
+	}
+	if got := codexClientRequestIDValue(httpReq.Header); got != "" {
+		t.Fatalf("compact x-client-request-id = %q, want absent", got)
+	}
+	for header, want := range map[string]string{
+		"X-Codex-Installation-Id":  "install-compact",
+		"X-Codex-Window-Id":        "thread-compact:4",
+		"X-Codex-Parent-Thread-Id": "parent-compact",
+	} {
+		if got := headerValueCaseInsensitive(httpReq.Header, header); got != want {
+			t.Fatalf("%s = %q, want %q", header, got, want)
+		}
 	}
 }

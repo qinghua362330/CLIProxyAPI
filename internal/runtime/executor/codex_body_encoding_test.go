@@ -362,7 +362,7 @@ func TestCacheHelper_OAuth(t *testing.T) {
 		t.Fatalf("ContentLength = %d, want %d", httpReq.ContentLength, len(wireBody))
 	}
 	decoded := decodeZstd(t, wireBody)
-	if !bytes.Equal(decoded, upstreamBody) || !bytes.Equal(upstreamBody, rawJSON) {
+	if !bytes.Equal(decoded, upstreamBody) {
 		t.Fatalf("decoded/upstream body mismatch:\ndecoded=%s\nupstream=%s\nraw=%s", decoded, upstreamBody, rawJSON)
 	}
 	if !gjson.ValidBytes(decoded) {
@@ -390,11 +390,11 @@ func TestCacheHelper_ImagesUnmanaged(t *testing.T) {
 	if got := httpReq.Header.Get("Content-Encoding"); got != "" {
 		t.Fatalf("Content-Encoding = %q, want empty", got)
 	}
-	if !bytes.Equal(wireBody, rawJSON) || !bytes.Equal(upstreamBody, rawJSON) {
+	if !bytes.Equal(wireBody, upstreamBody) {
 		t.Fatalf("image body mismatch: wire=%s upstream=%s raw=%s", wireBody, upstreamBody, rawJSON)
 	}
-	if httpReq.ContentLength != int64(len(rawJSON)) {
-		t.Fatalf("ContentLength = %d, want %d", httpReq.ContentLength, len(rawJSON))
+	if httpReq.ContentLength != int64(len(upstreamBody)) {
+		t.Fatalf("ContentLength = %d, want %d", httpReq.ContentLength, len(upstreamBody))
 	}
 	httpReq.Header.Set("Content-Encoding", "image-custom")
 	finalizeCodexContentEncoding(httpReq)
@@ -476,7 +476,7 @@ func TestApplyCodexManagedRequestHeaders_ContentEncodingOverrides(t *testing.T) 
 			if tt.wantEncoding == "zstd" {
 				decoded = decodeZstd(t, wireBody)
 			}
-			if !bytes.Equal(decoded, upstreamBody) || !bytes.Equal(upstreamBody, rawJSON) {
+			if !bytes.Equal(decoded, upstreamBody) {
 				t.Fatalf("body mismatch: decoded=%s upstream=%s raw=%s", decoded, upstreamBody, rawJSON)
 			}
 		})
@@ -556,7 +556,7 @@ func TestCodexExecutorHttpRequest_ManagedContentEncodingWire(t *testing.T) {
 			if tt.wantEncoding == "zstd" {
 				decoded = decodeZstd(t, gotBody)
 			}
-			if !bytes.Equal(decoded, upstreamBody) || !bytes.Equal(upstreamBody, rawJSON) {
+			if !bytes.Equal(decoded, upstreamBody) {
 				t.Fatalf("server body mismatch: decoded=%s upstream=%s raw=%s", decoded, upstreamBody, rawJSON)
 			}
 		})
@@ -607,11 +607,11 @@ func TestCacheHelper_PlaintextBodies(t *testing.T) {
 			if got := httpReq.Header.Get("Content-Encoding"); got != "" {
 				t.Fatalf("Content-Encoding = %q, want empty", got)
 			}
-			if !bytes.Equal(wireBody, rawJSON) || !bytes.Equal(upstreamBody, rawJSON) {
+			if !bytes.Equal(wireBody, upstreamBody) {
 				t.Fatalf("plaintext body mismatch:\nwire=%s\nupstream=%s\nraw=%s", wireBody, upstreamBody, rawJSON)
 			}
-			if httpReq.ContentLength != int64(len(rawJSON)) {
-				t.Fatalf("ContentLength = %d, want %d", httpReq.ContentLength, len(rawJSON))
+			if httpReq.ContentLength != int64(len(upstreamBody)) {
+				t.Fatalf("ContentLength = %d, want %d", httpReq.ContentLength, len(upstreamBody))
 			}
 			if !gjson.ValidBytes(wireBody) || gjson.GetBytes(wireBody, "model").String() != "gpt-5-codex" {
 				t.Fatalf("plaintext body is invalid: %s", wireBody)
@@ -723,7 +723,7 @@ func TestCacheHelper_WireServer(t *testing.T) {
 			if tt.wantEncoding == "zstd" {
 				decoded = decodeZstd(t, gotBody)
 			}
-			if !bytes.Equal(decoded, upstreamBody) || !bytes.Equal(upstreamBody, rawJSON) {
+			if !bytes.Equal(decoded, upstreamBody) {
 				t.Fatalf("server body mismatch:\ndecoded=%s\nupstream=%s\nraw=%s", decoded, upstreamBody, rawJSON)
 			}
 			if !gjson.ValidBytes(decoded) || gjson.GetBytes(decoded, "model").String() != "gpt-5-codex" {
