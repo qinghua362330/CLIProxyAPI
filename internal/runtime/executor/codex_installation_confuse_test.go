@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -176,5 +177,149 @@ func TestIdentityConfuse_InstallationIDIsStableAcrossRequests(t *testing.T) {
 	b := gjson.Get(second, "installation_id").String()
 	if a != b {
 		t.Fatalf("installation_id drifted between requests for one account: %q then %q", a, b)
+	}
+}
+
+const (
+	realInboundTurnID    = "019f5aaa-1ca3-71f0-b3e4-de5b34ec347a"
+	realInboundSessionID = realInboundPromptCacheKey
+)
+
+func uuidMillisOf(t *testing.T, s string) int64 {
+	t.Helper()
+	u, err := uuid.Parse(s)
+	if err != nil {
+		t.Fatalf("parse %q: %v", s, err)
+	}
+	return codexUUIDMillis(u)
+}
+
+// A confused id must mirror the version of the id it replaces. A real client emits
+// session/thread/turn as version 7 and installation_id as version 4; uuid.NewSHA1 alone
+// emits version 5, which no real client ever produces.
+func TestIdentityConfuse_MirrorsRealClientUUIDVersions(t *testing.T) {
+	if got := realInboundSessionID[14]; got != '7' {
+		t.Fatalf("fixture drift: captured session id is version %c, want 7", got)
+	}
+	if got := realInboundInstallationID[14]; got != '4' {
+		t.Fatalf("fixture drift: captured installation id is version %c, want 4", got)
+	}
+
+	turnMetadata, sessionID, _ := outboundForAuth(t, "pool-account-42")
+	for name, got := range map[string]string{
+		"session-id":               sessionID,
+		"turn-metadata.session_id": gjson.Get(turnMetadata, "session_id").String(),
+		"turn-metadata.thread_id":  gjson.Get(turnMetadata, "thread_id").String(),
+		"turn-metadata.turn_id":    gjson.Get(turnMetadata, "turn_id").String(),
+	} {
+		if len(got) != 36 || got[14] != '7' {
+			t.Errorf("%s = %q (version %c), want version 7", name, got, got[14])
+		}
+	}
+	if got := gjson.Get(turnMetadata, "installation_id").String(); got[14] != '4' {
+		t.Errorf("installation_id = %q (version %c), want version 4", got, got[14])
+	}
+}
+
+// A version-7 id's leading 48 bits are a real millisecond timestamp, so the confused one
+// has to decode to a plausible instant. Reading a version-5 hash as v7 lands in the year
+// 6335 — visible to anyone who parses the id.
+func TestIdentityConfuse_V7TimestampStaysPlausible(t *testing.T) {
+	realMillis := uuidMillisOf(t, realInboundSessionID)
+	_, sessionID, _ := outboundForAuth(t, "pool-account-42")
+	got := uuidMillisOf(t, sessionID)
+
+	if got > realMillis {
+		t.Errorf("confused session id is %d ms in the future of the original; a session cannot start after itself", got-realMillis)
+	}
+	if realMillis-got > codexIdentityConfuseMaxSkewMillis {
+		t.Errorf("confused session id is %d ms before the original, beyond the %d ms bound", realMillis-got, codexIdentityConfuseMaxSkewMillis)
+	}
+}
+
+// One shift per account, applied to every id in the request: a real client mints a turn
+// after the session that contains it, and that ordering has to survive the remap.
+func TestIdentityConfuse_V7PreservesSessionToTurnOrdering(t *testing.T) {
+	turnMetadata, sessionID, _ := outboundForAuth(t, "pool-account-42")
+	session := uuidMillisOf(t, sessionID)
+	turn := uuidMillisOf(t, gjson.Get(turnMetadata, "turn_id").String())
+
+	if turn <= session {
+		t.Fatalf("turn (%d) is not after session (%d); the real client always mints it later", turn, session)
+	}
+	if want := uuidMillisOf(t, realInboundTurnID) - uuidMillisOf(t, realInboundSessionID); turn-session != want {
+		t.Errorf("session-to-turn gap = %d ms, want the original %d ms", turn-session, want)
+	}
+}
+
+// The shift must differ per account, or every account in the pool reports the identical
+// millisecond and the timestamp becomes the anchor the id no longer is.
+func TestIdentityConfuse_V7TimestampDiffersPerAccount(t *testing.T) {
+	_, sidA, _ := outboundForAuth(t, "pool-account-42")
+	_, sidB, _ := outboundForAuth(t, "pool-account-77")
+
+	if a, b := uuidMillisOf(t, sidA), uuidMillisOf(t, sidB); a == b {
+		t.Fatalf("two accounts reported the same session millisecond (%d)", a)
+	}
+}
+
+// An original that is not a UUID has no shape to mirror; leave the hash alone rather than
+// invent a version the caller never had.
+func TestIdentityConfuse_NonUUIDOriginalKeepsHashShape(t *testing.T) {
+	got := codexIdentityConfuseUUIDLike("pool-account-42", "prompt-cache", "not-a-uuid")
+	if want := codexIdentityConfuseUUID("pool-account-42", "prompt-cache", "not-a-uuid"); got != want {
+		t.Fatalf("codexIdentityConfuseUUIDLike = %q, want the plain hash %q", got, want)
+	}
+}
+
+// turn_id and turn_started_at_unix_ms are minted together off one clock: the capture has
+// them 17 ms apart. Shifting the v7 ids while leaving the plaintext sibling raw would put
+// a request's own two timestamps ~40 s apart — a self-contradiction no real client can
+// produce, and a sharper tell than the version nibble this shaping removes.
+func TestIdentityConfuse_TurnStartedAtTracksTurnID(t *testing.T) {
+	realTurnMillis := uuidMillisOf(t, realInboundTurnID)
+	realStartedAt := gjson.Get(realTurnMetadata, "turn_started_at_unix_ms").Int()
+	realDelta := realStartedAt - realTurnMillis
+	if realDelta < 0 || realDelta > 1000 {
+		t.Fatalf("fixture drift: captured turn_started_at is %d ms from turn_id, expected them minted together", realDelta)
+	}
+
+	for _, account := range []string{"pool-account-42", "pool-account-77"} {
+		turnMetadata, _, _ := outboundForAuth(t, account)
+		turnMillis := uuidMillisOf(t, gjson.Get(turnMetadata, "turn_id").String())
+		startedAt := gjson.Get(turnMetadata, "turn_started_at_unix_ms").Int()
+
+		if got := startedAt - turnMillis; got != realDelta {
+			t.Errorf("%s: turn_started_at is %d ms from turn_id, want the captured %d ms", account, got, realDelta)
+		}
+		if startedAt >= realStartedAt {
+			t.Errorf("%s: turn_started_at %d was not shifted (raw %d)", account, startedAt, realStartedAt)
+		}
+	}
+}
+
+// The shift is one virtual clock per account: every timestamp the request carries moves by
+// the same amount, or the request contradicts itself.
+func TestIdentityConfuse_OneClockShiftPerAccount(t *testing.T) {
+	realSession := uuidMillisOf(t, realInboundSessionID)
+	realTurn := uuidMillisOf(t, realInboundTurnID)
+	realStartedAt := gjson.Get(realTurnMetadata, "turn_started_at_unix_ms").Int()
+
+	for _, account := range []string{"pool-account-42", "pool-account-77"} {
+		turnMetadata, sessionID, _ := outboundForAuth(t, account)
+		shifts := map[string]int64{
+			"session-id":              realSession - uuidMillisOf(t, sessionID),
+			"turn_id":                 realTurn - uuidMillisOf(t, gjson.Get(turnMetadata, "turn_id").String()),
+			"turn_started_at_unix_ms": realStartedAt - gjson.Get(turnMetadata, "turn_started_at_unix_ms").Int(),
+		}
+		want := shifts["session-id"]
+		if want <= 0 {
+			t.Fatalf("%s: session was not shifted backwards (%d ms)", account, want)
+		}
+		for name, got := range shifts {
+			if got != want {
+				t.Errorf("%s: %s shifted %d ms, want the account's single offset %d ms", account, name, got, want)
+			}
+		}
 	}
 }
