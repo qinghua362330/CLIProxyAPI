@@ -1554,6 +1554,24 @@ func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexI
 	if state.promptCacheKey != "" && gjson.Get(rawTurnMetadata, "window_id").Exists() {
 		updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "window_id", state.promptCacheKey+":0")
 	}
+	// installation_id is stable for the life of a Codex install, so an unconfused one
+	// is the strongest cross-account correlation anchor there is: every account in the
+	// pool would carry the same value for a given downstream client. The
+	// client_metadata.x-codex-installation-id path never covers it — a real client
+	// (Codex Desktop 0.144.x, live-captured 2026-07-17) sends installation_id ONLY here,
+	// in x-codex-turn-metadata, and sends no client_metadata at all. The ReplaceAll above
+	// cannot reach it either, since installation_id never equals prompt_cache_key.
+	// Same "installation" kind as the body path so both agree when both are present,
+	// but stamped version 4 to match what a real client's randomly-generated install id
+	// looks like. Guard on authID: a blank one would hash identically for every account,
+	// i.e. confused-looking but still a perfect correlation anchor.
+	if strings.TrimSpace(state.authID) != "" {
+		if installationID := strings.TrimSpace(gjson.Get(rawTurnMetadata, "installation_id").String()); installationID != "" {
+			if confused := codexIdentityConfuseUUIDv4(state.authID, "installation", installationID); confused != "" {
+				updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "installation_id", confused)
+			}
+		}
+	}
 	return updatedTurnMetadata
 }
 
@@ -1608,6 +1626,27 @@ func codexIdentityConfuseEnabled(cfg *config.Config) bool {
 func codexIdentityConfuseUUID(authID string, kind string, value string) string {
 	name := strings.Join([]string{"cli-proxy-api", "codex", "identity-confuse", kind, strings.TrimSpace(authID), strings.TrimSpace(value)}, ":")
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String()
+}
+
+// codexIdentityConfuseUUIDv4 is codexIdentityConfuseUUID re-stamped as a version-4
+// UUID. It stays deterministic per (authID, kind, value) — an install id that changed
+// between requests would be its own tell — while matching the shape a real client
+// emits: codex generates installation_id randomly, so a live capture shows version 4
+// (6ae1cc61-7e89-4a8c-…), whereas uuid.NewSHA1 yields version 5. Only the version
+// nibble is rewritten; NewSHA1 already sets the RFC 4122 variant, and a v4's payload
+// is defined to be opaque, so the result is indistinguishable from a random one.
+//
+// Not used for the session/thread/turn ids: a real client emits those as version 7,
+// whose leading 48 bits are a real millisecond timestamp, so re-stamping alone would
+// not make them plausible. Those still emit version 5 — a pre-existing tell tracked
+// separately.
+func codexIdentityConfuseUUIDv4(authID string, kind string, value string) string {
+	parsed, err := uuid.Parse(codexIdentityConfuseUUID(authID, kind, value))
+	if err != nil {
+		return ""
+	}
+	parsed[6] = (parsed[6] & 0x0f) | 0x40
+	return parsed.String()
 }
 
 func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {
