@@ -67,7 +67,15 @@ jobs:
             git add -A
             git commit -m "sync: upstream/$UREF (CONFLICTS — resolve manually)" || true
             git push origin "$BR"
-            gh pr create --base "$TARGET" --head "$BR" \
-              --title "⚠️ upstream sync needs manual conflict resolution ($UREF)" \
-              --body "Automated upstream sync hit conflicts. Resolve the conflict markers here, run \`go build ./... && go test ./...\` plus \`FP_VERIFY=1 go test ./internal/runtime/executor/helps/ -run TestFingerprintAgainstReporter\`, then merge. Likely conflict files: utls_client.go, claude_executor.go, codex_*executor.go (see SYNC.md)." || true
+            PR_TITLE="⚠️ upstream sync needs manual conflict resolution ($UREF)"
+            PR_BODY="Automated upstream sync hit conflicts. Resolve the conflict markers here, run \`go build ./... && go test ./...\` plus \`FP_VERIFY=1 go test ./internal/runtime/executor/helps/ -run TestFingerprintAgainstReporter\`, then merge. Likely conflict files: utls_client.go, claude_executor.go, codex_*executor.go (see SYNC.md)."
+            # gh pr create needs "Allow GitHub Actions to create and approve pull requests"
+            # (Settings -> Actions -> General). If that repo toggle is off, GITHUB_TOKEN
+            # gets "Resource not accessible by integration". Do NOT swallow that — the
+            # branch is pushed but a silent failure here looks like a green no-op run and
+            # the conflict sits unnoticed. Surface it as an error so the run goes red.
+            if ! gh pr create --base "$TARGET" --head "$BR" --title "$PR_TITLE" --body "$PR_BODY"; then
+              echo "::error::Pushed $BR but could not open a PR. Enable Settings -> Actions -> General -> 'Allow GitHub Actions to create and approve pull requests', or open the PR manually from $BR."
+              exit 1
+            fi
           fi
